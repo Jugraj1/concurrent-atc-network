@@ -100,7 +100,7 @@ int assign_in_gate(gate_t *gate, int plane_id, int start, int duration, int fuel
   for (idx = start; idx <= (start + fuel) && (end < NUM_TIME_SLOTS); idx++) {
     end = idx + duration;
     if (check_time_slots_free(gate, idx, end)) {
-      add_plane_to_slots(gate, plane_id, start, end);
+      add_plane_to_slots(gate, plane_id, start, duration);
       return idx;
     }
   }

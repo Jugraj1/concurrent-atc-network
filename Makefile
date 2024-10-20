@@ -2,7 +2,8 @@
 CC=gcc
 
 # Settings to use for the compilation
-CFLAGS=-Wall -Wconversion -g -ggdb3 -fsanitize=thread
+# You may want to add the flag `-fsanitize=thread` when working on your multithreaded code
+CFLAGS=-Wall -Wconversion -g -ggdb3 
 
 PROGS = controller
 OBJS = $(addsuffix .o, $(PROGS))
@@ -10,7 +11,7 @@ OBJS = $(addsuffix .o, $(PROGS))
 all: $(PROGS)
 
 ifdef LOG
-CFLAGS += -DENABLE_LOG -fsanitize=thread
+CFLAGS += -DENABLE_LOG
 endif
 
 ifdef RELEASE
