@@ -39,9 +39,83 @@ controller_params_t ATC_INFO;
  */
 void controller_server_loop(void) {
   int listenfd = ATC_INFO.listenfd;
-  /** TODO: implement this function! */
+  fd_set all_fds, read_fds;
+  struct sockaddr_in client_addr;
+  socklen_t client_len = sizeof(client_addr);
+  // To keep track of the highest file descriptor
+  int max_fd = listenfd;
+  int newfd;              // New socket descriptor for accepted connection
+  int nready;             // Number of file descriptors ready for reading
+  char buffer[256];       // Buffer to hold received data
+  int i, n;
+
+  FD_ZERO(&all_fds);           // Initialize the master set
+  FD_SET(listenfd, &all_fds);  // Add listenfd to the set
   while (1) {
-    /* ... */
+    read_fds = all_fds;  // Copy the master set to the read set
+
+    // Use select() to wait for activity on any of the file descriptors
+    nready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+    if (nready == -1)
+    {
+      perror("select");
+      exit(1);
+    }
+
+    // Check if there is an incoming connection on the listening socket
+    if (FD_ISSET(listenfd, &read_fds))
+    {
+      // Accept new connection
+      newfd = accept(listenfd, (struct sockaddr *)&client_addr, &client_len);
+      if (newfd == -1)
+      {
+        perror("accept");
+        continue;
+      }
+
+      // Add the new socket to the set of all file descriptors
+      FD_SET(newfd, &all_fds);
+
+      if (newfd > max_fd)
+      {
+        max_fd = newfd;  // Update max_fd if necessary
+      }
+
+      // Log the connection (you can print client info or airport node ID)
+      printf("Controller: Accepted new connection on fd %d\n", newfd);
+    }
+
+    // Check all connected clients (airports) for incoming data
+    for (i = 0; i <= max_fd; i++) {
+      if (i != listenfd && FD_ISSET(i, &read_fds)) {
+        // Receive data from the airport node
+        //TODO: NORMAL READ, MUST BE MODIFIED TO RIO
+
+        n = recv(i, buffer, sizeof(buffer), 0);
+        if (n <= 0)
+        {
+          // Connection closed by the client or error
+          if (n == 0)
+          {
+            printf("Controller: Connection closed on fd %d\n", i);
+          } else
+          {
+            perror("recv");
+          }
+          close(i);          // Close the socket
+          FD_CLR(i, &all_fds); // Remove from the master set
+        }
+        else
+        {
+          // Process received data
+          buffer[n] = '\0';  // Null-terminate the string
+          printf("Controller: Received message: %s\n", buffer);
+
+          //LOGIC ADD HERE
+          send(i, "Acknowledged", strlen("Acknowledged"), 0);
+        }
+      }
+    }  
   }
 }
 

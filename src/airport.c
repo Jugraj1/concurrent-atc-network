@@ -143,9 +143,49 @@ void initialise_node(int airport_id, int num_gates, int listenfd) {
   airport_node_loop(listenfd);
 }
 
+int handle_client(int client_fd)
+{
+  char buffer[MAXLINE];
+  rio_t rio;
+
+  // Initialise the rio_t structure
+  rio_readinitb(&rio, client_fd);
+
+  // read data from the client, one line
+  ssize_t read_size;
+  while ((read_size = rio_readlineb(&rio, buffer, MAXLINE)) > 0)
+  {
+    // Print the received command
+    printf("Server received: %s", buffer);
+  }
+
+  if (read_size == 0)
+  {
+    printf("Client disconnected.\n");
+  }
+  else if (read_size < 0) {
+    perror("Rio read error");
+  }
+}
+
 void airport_node_loop(int listenfd) {
-  /** TODO: implement the main server loop for an individual airport node here. */
-  while (1) {
-    /* ... */
+  struct sockaddr_in client_addr;
+  socklen_t client_len = sizeof(client_addr);
+  int client_fd;
+
+  while (1)
+  {
+    client_fd = accept(listenfd, (struct sockadd *)&client_addr, &client_len);
+    if (client_fd < 0)
+    {
+      perror("accept failed\n");
+      continue;
+    }
+
+    // Handle the request from the client
+    handle_client(client_fd);
+
+    //close
+    close(client_fd);
   }
 }
