@@ -88,32 +88,134 @@ void controller_server_loop(void) {
     // Check all connected clients (airports) for incoming data
     for (i = 0; i <= max_fd; i++) {
       if (i != listenfd && FD_ISSET(i, &read_fds)) {
-        // Receive data from the airport node
-        //TODO: NORMAL READ, MUST BE MODIFIED TO RIO
+        // Receive data from the client (Airplane / Airport)
+        char buffer[MAXLINE];
+        rio_t rio;
 
-        n = recv(i, buffer, sizeof(buffer), 0);
-        if (n <= 0)
+        // Initialise the rio_t structure
+        rio_readinitb(&rio, i);
+
+        ssize_t read_size;
+        read_size = rio_readlineb(&rio, buffer, MAXLINE);
+        if (read_size < 0)
         {
-          // Connection closed by the client or error
-          if (n == 0)
-          {
-            printf("Controller: Connection closed on fd %d\n", i);
-          } else
-          {
-            perror("recv");
-          }
-          close(i);          // Close the socket
-          FD_CLR(i, &all_fds); // Remove from the master set
+          perror("Rio read error");
         }
-        else
+
+        buffer[read_size] = '\0';  // Null-terminate the string
+
+        //Check if it is a command
+        char first_word[30];
+
+        int airport_num;
+        // Use sscanf to read the first word from the buffer without modifying it
+        sscanf(buffer, "%29s", first_word);
+        if (strncasecmp(first_word, "SCHEDULE", 8) == 0
+            || strncasecmp(first_word, "PLANE_STATUS", 12) == 0
+            || strncasecmp(first_word, "TIME_STATUS", 11) == 0)
         {
-          // Process received data
-          buffer[n] = '\0';  // Null-terminate the string
-          printf("Controller: Received message: %s\n", buffer);
+          printf("Request from airplane (maybe valid or invalid).\n");
+          if (strncasecmp(first_word, "SCHEDULE", 8) == 0)
+          {
+            int plane_id, earliest_time, duration, fuel;
+            // Use sscanf to check if the request matches the expected format
+            int matched = sscanf(buffer, "%s %d %d %d %d %d", first_word, &airport_num, &plane_id, &earliest_time, &duration, &fuel);
+            if (matched == 6)
+            {
+              // Process the command
+              sprintf(buffer, "%s %d %d %d %d", first_word, plane_id, earliest_time, duration, fuel);
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, sizeof(message));
+            }
+            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
+            {
+              char response[100];
+              sprintf(response, "Airport %d does not exist\n", airport_num);
+              rio_writen(i, response, sizeof(response));
+            }
+          } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
+          {
+            int plane_id;
+            // Use sscanf to check if the request matches the expected format
+            int matched = sscanf(buffer, "%s %d %d", first_word, &airport_num, &plane_id);
+            if (matched == 3)
+            {
+              // Process the command
+              sprintf(buffer, "%s %d", first_word, plane_id);
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, sizeof(message));
+            }
+            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
+            {
+              char response[100];
+              sprintf(response, "Airport %d does not exist\n", airport_num);
+              rio_writen(i, response, sizeof(response));
+            }
+          }
+        } else if (strncasecmp(first_word, "SCHEDULED", 9) == 0
+                    || strncasecmp(first_word, "PLANE", 5) == 0
+                    || strncasecmp(first_word, "AIRPORT", 7) == 0)
+        {
+          printf("Response from an airport (maybe valid or invalid).\n");
+        } else
+        {
+          char message[] = "Error: Invalid request provided\n";
+          rio_writen(i, message, sizeof(message));
+        }
+
+        printf("Controller: Received message: %s\n", buffer);
+
+        //Forward this buffer to all the airports for the time being
+        //first get info for all the airports
+        node_info_t *airport_nodes = ATC_INFO.airport_nodes;
+        int total_air = ATC_INFO.num_airports;
+
+        for (int j = 0; j < total_air; j++)
+        {
+          int airport_id = airport_nodes[j].id;
+          if (airport_id != airport_num)
+          {
+            continue;
+          }
+          int airport_port = airport_nodes[j].port;
+          int airport_fd = socket(AF_INET, SOCK_STREAM, 0);
+          if (airport_fd < 0)
+          {
+            perror("socket");
+            continue;
+          }
+
+          struct sockaddr_in airport_addr;
+          memset(&airport_addr, 0, sizeof(airport_addr));
+          airport_addr.sin_family = AF_INET;
+          airport_addr.sin_port = htons(airport_port);
+          airport_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); //Assuming local host
+
+          if (connect(airport_fd, (struct sockaddr *)&airport_addr, sizeof(airport_addr)) < 0)
+          {
+            perror("connect");
+            close(airport_fd);
+            continue;
+          }
+
+          // Send data to airport using rio
+          int write_num = rio_writen(airport_fd, buffer, strlen(buffer));
+          if (write_num == -1)
+          {
+            perror("send");
+          }
+          close(airport_fd); // Close after sending to avoid too many open sockets
+          printf("The data was received by airport: %i, confirming, %i\n", airport_num, airport_id);
+          break;//after the correct airport received data
+        }
 
           //LOGIC ADD HERE
-          send(i, "Acknowledged", strlen("Acknowledged"), 0);
-        }
+          send(i, "Acknowledged\n", strlen("Acknowledged\n"), 0);
+        // }
       }
     }  
   }

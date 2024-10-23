@@ -100,7 +100,7 @@ int assign_in_gate(gate_t *gate, int plane_id, int start, int duration, int fuel
   for (idx = start; idx <= (start + fuel) && (end < NUM_TIME_SLOTS); idx++) {
     end = idx + duration;
     if (check_time_slots_free(gate, idx, end)) {
-      add_plane_to_slots(gate, plane_id, start, duration);
+      add_plane_to_slots(gate, plane_id, start, end);
       return idx;
     }
   }
@@ -155,15 +155,13 @@ int handle_client(int client_fd)
   ssize_t read_size;
   while ((read_size = rio_readlineb(&rio, buffer, MAXLINE)) > 0)
   {
+    // read_size = rio_readlineb(&rio, buffer, MAXLINE);
     // Print the received command
     printf("Server received: %s", buffer);
   }
 
-  if (read_size == 0)
+  if (read_size < 0)
   {
-    printf("Client disconnected.\n");
-  }
-  else if (read_size < 0) {
     perror("Rio read error");
   }
 }
@@ -171,15 +169,13 @@ int handle_client(int client_fd)
 void airport_node_loop(int listenfd) {
   struct sockaddr_in client_addr;
   socklen_t client_len = sizeof(client_addr);
-  int client_fd;
+  int client_fd, res;
 
   while (1)
   {
-    client_fd = accept(listenfd, (struct sockadd *)&client_addr, &client_len);
-    if (client_fd < 0)
-    {
-      perror("accept failed\n");
-      continue;
+    if ((client_fd = accept(listenfd, (SA *)&client_addr, &client_len)) < 0) {
+      perror("accept");
+      exit(1);
     }
 
     // Handle the request from the client
