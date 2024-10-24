@@ -102,14 +102,20 @@ void controller_server_loop(void) {
           perror("Rio read error");
         }
 
-        buffer[read_size] = '\0';  // Null-terminate the string
+        // buffer[read_size] = '\0';  // Null-terminate the string
 
         //Check if it is a command
         char first_word[30];
 
         int airport_num;
         // Use sscanf to read the first word from the buffer without modifying it
-        sscanf(buffer, "%29s", first_word);
+        int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
+        if (matched != 2)
+        {
+          char message[] = "Error: Invalid request provided\n";
+          rio_writen(i, message, strlen(message) + 1);
+          continue;
+        }
         if (strncasecmp(first_word, "SCHEDULE", 8) == 0
             || strncasecmp(first_word, "PLANE_STATUS", 12) == 0
             || strncasecmp(first_word, "TIME_STATUS", 11) == 0)
@@ -120,40 +126,66 @@ void controller_server_loop(void) {
             int plane_id, earliest_time, duration, fuel;
             // Use sscanf to check if the request matches the expected format
             int matched = sscanf(buffer, "%s %d %d %d %d %d", first_word, &airport_num, &plane_id, &earliest_time, &duration, &fuel);
-            if (matched == 6)
-            {
-              // Process the command
-              sprintf(buffer, "%s %d %d %d %d", first_word, plane_id, earliest_time, duration, fuel);
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, sizeof(message));
-            }
             if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
             {
               char response[100];
               sprintf(response, "Airport %d does not exist\n", airport_num);
-              rio_writen(i, response, sizeof(response));
+              rio_writen(i, response, strlen(response) + 1);
+              continue;
+            }
+            if (matched == 6)
+            {
+              // Process the command
+              sprintf(buffer, "%s %d %d %d %d\n", first_word, plane_id, earliest_time, duration, fuel);
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
             }
           } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
           {
             int plane_id;
             // Use sscanf to check if the request matches the expected format
             int matched = sscanf(buffer, "%s %d %d", first_word, &airport_num, &plane_id);
-            if (matched == 3)
-            {
-              // Process the command
-              sprintf(buffer, "%s %d", first_word, plane_id);
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, sizeof(message));
-            }
             if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
             {
               char response[100];
               sprintf(response, "Airport %d does not exist\n", airport_num);
-              rio_writen(i, response, sizeof(response));
+              rio_writen(i, response, strlen(response) + 1);
+              continue;
+            }
+            if (matched == 3)
+            {
+              // Process the command
+              sprintf(buffer, "%s %d\n", first_word, plane_id);
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
+            }
+          } else if (strncasecmp(first_word, "TIME_STATUS", 11) == 0)
+          {
+            int gate_num, start_idx, duration;
+            // Use sscanf to check if the request matches the expected format
+            int matched = sscanf(buffer, "%s %d %d %d %d", first_word, &airport_num, &gate_num, &start_idx, &duration);
+            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
+            {
+              char response[100];
+              sprintf(response, "Airport %d does not exist\n", airport_num);
+              rio_writen(i, response, strlen(response) + 1);
+              continue;
+            }
+            if (matched == 5)
+            {
+              // Process the command
+              sprintf(buffer, "%s %d %d %d\n", first_word, gate_num, start_idx, duration);
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
             }
           }
         } else if (strncasecmp(first_word, "SCHEDULED", 9) == 0
@@ -164,10 +196,11 @@ void controller_server_loop(void) {
         } else
         {
           char message[] = "Error: Invalid request provided\n";
-          rio_writen(i, message, sizeof(message));
+          rio_writen(i, message, strlen(message) + 1);
+          continue;
         }
 
-        printf("Controller: Received message: %s\n", buffer);
+        printf("Controller: Received message: %s", buffer);
 
         //Forward this buffer to all the airports for the time being
         //first get info for all the airports
@@ -203,7 +236,7 @@ void controller_server_loop(void) {
           }
 
           // Send data to airport using rio
-          int write_num = rio_writen(airport_fd, buffer, strlen(buffer));
+          int write_num = rio_writen(airport_fd, buffer, strlen(buffer) + 1);
           if (write_num == -1)
           {
             perror("send");
