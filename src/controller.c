@@ -6,6 +6,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "requests.h"
+#include "uthash.h"
 
 #include "airport.h"
 
@@ -32,6 +34,46 @@ typedef struct controller_params_t {
 } controller_params_t;
 
 controller_params_t ATC_INFO;
+
+// Define a structure for the hash table
+typedef struct {
+    int airport_id;    // Airport identifier
+    int airport_fd;    // File descriptor for the airport
+    UT_hash_handle hh; // Makes this structure hashable
+} AirportFDMap;
+
+AirportFDMap *airport_fd_map = NULL;  // Hash table pointer
+
+void add_airport_fd(int airport_id, int airport_fd) {
+    AirportFDMap *entry = malloc(sizeof(AirportFDMap));
+    entry->airport_id = airport_id;
+    entry->airport_fd = airport_fd;
+    HASH_ADD_INT(airport_fd_map, airport_id, entry);
+}
+
+void close_airport_fd(int airport_id, fd_set all_fds) {
+    AirportFDMap *entry;
+    HASH_FIND_INT(airport_fd_map, &airport_id, entry);  // Lookup by airport_id
+    if (entry) {
+        printf("Closing connection for airport id %d (fd: %d).\n", airport_id, entry->airport_fd);
+        close(entry->airport_fd);   // Close the file descriptor
+        FD_CLR(entry->airport_fd, &all_fds);  // Remove from the select set
+        HASH_DEL(airport_fd_map, entry);      // Remove entry from hash table
+        free(entry);                          // Free memory
+    } else {
+        printf("Airport id %d not found in the map.\n", airport_id);
+    }
+}
+
+int get_max_fd(fd_set *set, int current_max) {
+    int max_fd = -1;
+    for (int fd = 0; fd < current_max; fd++) {
+        if (FD_ISSET(fd, set)) {
+            max_fd = fd > max_fd ? fd : max_fd;
+        }
+    }
+    return max_fd;
+}
 
 /** @brief The main server loop of the controller.
  *
@@ -67,6 +109,7 @@ void controller_server_loop(void) {
     {
       // Accept new connection
       newfd = accept(listenfd, (struct sockaddr *)&client_addr, &client_len);
+      // set_nonblocking(newfd);
       if (newfd == -1)
       {
         perror("accept");
@@ -109,6 +152,7 @@ void controller_server_loop(void) {
 
         int airport_num;
         // Use sscanf to read the first word from the buffer without modifying it
+        printf("The buffer content : %s", buffer);
         int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
         if (matched != 2)
         {
@@ -116,60 +160,84 @@ void controller_server_loop(void) {
           rio_writen(i, message, strlen(message) + 1);
           continue;
         }
-        if (strncasecmp(first_word, "SCHEDULE", 8) == 0
-            || strncasecmp(first_word, "PLANE_STATUS", 12) == 0
-            || strncasecmp(first_word, "TIME_STATUS", 11) == 0)
+
+        request_t req; //req being sent to the airport
+
+        if (strcasecmp(first_word, "SCHEDULE") == 0
+            || strcasecmp(first_word, "PLANE_STATUS") == 0
+            || strcasecmp(first_word, "TIME_STATUS") == 0)
         {
           printf("Request from airplane (maybe valid or invalid).\n");
           if (strncasecmp(first_word, "SCHEDULE", 8) == 0)
           {
+            req.type = SCHEDULE_REQUEST;
             int plane_id, earliest_time, duration, fuel;
             // Use sscanf to check if the request matches the expected format
             int matched = sscanf(buffer, "%s %d %d %d %d %d", first_word, &airport_num, &plane_id, &earliest_time, &duration, &fuel);
+            if (matched == 6)
+            {
+              // Process the command
+              // sprintf(buffer, "%s %d %d %d %d\n", first_word, plane_id, earliest_time, duration, fuel);
+              req.data.schedule.plane_id = plane_id;
+              req.data.schedule.earliest_time = earliest_time;
+              req.data.schedule.duration = duration;
+              req.data.schedule.fuel = fuel;
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
+            }
             if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
             {
               char response[100];
               sprintf(response, "Airport %d does not exist\n", airport_num);
               rio_writen(i, response, strlen(response) + 1);
-              continue;
-            }
-            if (matched == 6)
-            {
-              // Process the command
-              sprintf(buffer, "%s %d %d %d %d\n", first_word, plane_id, earliest_time, duration, fuel);
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
               continue;
             }
           } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
           {
+            req.type = PLANE_STATUS_REQUEST;
             int plane_id;
             // Use sscanf to check if the request matches the expected format
             int matched = sscanf(buffer, "%s %d %d", first_word, &airport_num, &plane_id);
+            if (matched == 3)
+            {
+              // Process the command
+              // sprintf(buffer, "%s %d\n", first_word, plane_id);
+              req.data.plane_status.plane_id = plane_id;
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
+            }
             if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
             {
               char response[100];
               sprintf(response, "Airport %d does not exist\n", airport_num);
               rio_writen(i, response, strlen(response) + 1);
-              continue;
-            }
-            if (matched == 3)
-            {
-              // Process the command
-              sprintf(buffer, "%s %d\n", first_word, plane_id);
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
               continue;
             }
           } else if (strncasecmp(first_word, "TIME_STATUS", 11) == 0)
           {
+            req.type = TIME_STATUS_REQUEST;
             int gate_num, start_idx, duration;
             // Use sscanf to check if the request matches the expected format
             int matched = sscanf(buffer, "%s %d %d %d %d", first_word, &airport_num, &gate_num, &start_idx, &duration);
+            if (matched == 5)
+            {
+              // Process the command
+              // sprintf(buffer, "%s %d %d %d\n", first_word, gate_num, start_idx, duration);
+              req.data.time_status.gate_num = gate_num;
+              req.data.time_status.start_idx = start_idx;
+              req.data.time_status.duration = duration;
+            } else
+            {
+              char message[] = "Error: Invalid request provided\n";
+              rio_writen(i, message, strlen(message) + 1);
+              continue;
+            }
             if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
             {
               char response[100];
@@ -177,22 +245,25 @@ void controller_server_loop(void) {
               rio_writen(i, response, strlen(response) + 1);
               continue;
             }
-            if (matched == 5)
-            {
-              // Process the command
-              sprintf(buffer, "%s %d %d %d\n", first_word, gate_num, start_idx, duration);
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
-              continue;
-            }
           }
-        } else if (strncasecmp(first_word, "SCHEDULED", 9) == 0
-                    || strncasecmp(first_word, "PLANE", 5) == 0
-                    || strncasecmp(first_word, "AIRPORT", 7) == 0)
+        } else if (strcasecmp(first_word, "SCHEDULED") == 0
+                    || strcasecmp(first_word, "PLANE") == 0
+                    || strcasecmp(first_word, "AIRPORT") == 0)
         {
           printf("Response from an airport (maybe valid or invalid).\n");
+          int airport_id;
+          sscanf(buffer, "%*[^[][%d]", &airport_id);
+          // close_airport_fd(airport_id, all_fds);
+          AirportFDMap *entry;
+          HASH_FIND_INT(airport_fd_map, &airport_id, entry); 
+          if (entry->airport_fd == max_fd)
+          {
+            max_fd = get_max_fd(&all_fds, max_fd);
+          }
+          close_airport_fd(airport_id, all_fds);
+          // close(open_fd);   // Close the file descriptor
+          // FD_CLR(open_fd, &all_fds); 
+          break;
         } else
         {
           char message[] = "Error: Invalid request provided\n";
@@ -235,14 +306,23 @@ void controller_server_loop(void) {
             continue;
           }
 
+          add_airport_fd(airport_id, airport_fd);
+
           // Send data to airport using rio
-          int write_num = rio_writen(airport_fd, buffer, strlen(buffer) + 1);
+          int write_num = rio_writen(airport_fd, &req, sizeof(request_t));
           if (write_num == -1)
           {
             perror("send");
           }
-          close(airport_fd); // Close after sending to avoid too many open sockets
+          FD_SET(airport_fd, &all_fds);
+
+          if (airport_fd > max_fd)
+          {
+            max_fd = airport_fd;  // Update max_fd if necessary
+          }
+          // close(airport_fd); // Close after sending to avoid too many open sockets
           printf("The data was received by airport: %i, confirming, %i\n", airport_num, airport_id);
+          // i--;
           break;//after the correct airport received data
         }
 

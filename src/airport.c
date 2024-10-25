@@ -1,4 +1,5 @@
 #include "airport.h"
+#include "requests.h"
 
 /** This is the main file in which you should implement the airport server code.
  *  There are many functions here which are pre-written for you. You should read
@@ -145,25 +146,58 @@ void initialise_node(int airport_id, int num_gates, int listenfd) {
 
 int handle_client(int client_fd)
 {
-  char buffer[MAXLINE];
+  // char buffer[MAXLINE];
   rio_t rio;
+  rio_readinitb(&rio, client_fd);
+  request_t req;
+  rio_readnb(&rio, &req, sizeof(request_t));  // Read the entire structure
 
   // Initialise the rio_t structure
-  rio_readinitb(&rio, client_fd);
+  // rio_readinitb(&rio, client_fd);
 
   // read data from the client, one line
-  ssize_t read_size;
-  while ((read_size = rio_readlineb(&rio, buffer, MAXLINE)) > 0)
-  {
+  // ssize_t read_size;
+  // while ((read_size = rio_readlineb(&rio, buffer, MAXLINE)) > 0)
+  // {
     // read_size = rio_readlineb(&rio, buffer, MAXLINE);
     // Print the received command
-    printf("Server received: %s", buffer);
-  }
+  switch (req.type) {
+    case SCHEDULE_REQUEST:
+      printf("Request type: SCHEDULE_REQUEST\n");
+      int pl_id = req.data.schedule.plane_id;
+      int er_time = req.data.schedule.earliest_time;
+      int dur = req.data.schedule.duration;
+      int fuel = req.data.schedule.fuel;
+      time_info_t schedule = schedule_plane(pl_id, er_time, dur, fuel);
+      if (schedule.gate_number != -1 && schedule.start_time != -1 && schedule.end_time != -1)
+      {
+        char response[100];
+        sprintf(response, "SCHEDULED %d at GATE %d : %02d:%02d-%02d:%02d [%d]\n", pl_id, schedule.gate_number,
+                IDX_TO_HOUR(schedule.start_time), IDX_TO_MINS(schedule.start_time), IDX_TO_HOUR(schedule.end_time), IDX_TO_MINS(schedule.end_time), AIRPORT_ID);
+        // printf("response: %s", response);
+        rio_writen(client_fd, response, strlen(response) + 1);
+      } else
+      {
+        char response[100];
+        sprintf(response, "Error: Cannot schedule %d [%d]", pl_id, AIRPORT_ID);
+        rio_writen(client_fd, response, strlen(response) + 1);
+      }
+      break;
+    case PLANE_STATUS_REQUEST:
+      printf("Request type: PLANE_STATUS_REQUEST\n");
+      break;
+    case TIME_STATUS_REQUEST:
+      printf("Request type: TIME_STATUS_REQUEST\n");
+      break;
+    default:
+      printf("Unknown request type\n");
+  };
+  // }
 
-  if (read_size < 0)
-  {
-    perror("Rio read error");
-  }
+  // if (read_size < 0)
+  // {
+  //   perror("Rio read error");
+  // }
 }
 
 void airport_node_loop(int listenfd) {
