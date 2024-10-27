@@ -140,6 +140,7 @@ void controller_server_loop(void) {
 
         ssize_t read_size;
         read_size = rio_readlineb(&rio, buffer, MAXLINE);
+
         if (read_size < 0)
         {
           perror("Rio read error");
@@ -152,9 +153,8 @@ void controller_server_loop(void) {
 
         int airport_num;
         // Use sscanf to read the first word from the buffer without modifying it
-        printf("The buffer content : %s", buffer);
         int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
-        if (matched != 2)
+        if (matched != 2 && strcmp(first_word, "ERROR") == 1)
         {
           char message[] = "Error: Invalid request provided\n";
           rio_writen(i, message, strlen(message) + 1);
@@ -250,10 +250,24 @@ void controller_server_loop(void) {
                     || strcasecmp(first_word, "PLANE") == 0
                     || strcasecmp(first_word, "AIRPORT") == 0)
         {
-          printf("Response from an airport (maybe valid or invalid).\n");
+          // printf("Response from an airport (maybe valid or invalid).\n");
+          //send back to the client
           int airport_id;
-          sscanf(buffer, "%*[^[][%d]", &airport_id);
-          // close_airport_fd(airport_id, all_fds);
+          char prefix[100];
+          int identifier = sscanf(buffer, "%99[^[][%d]", prefix, &airport_id);
+          rio_writen(newfd, prefix, strlen(prefix) + 1);
+          if (strcasecmp(first_word, "AIRPORT") == 0 && identifier != 2)
+          {
+            int reads = rio_readlineb(&rio, buffer, MAXLINE);
+            while (reads > 0)
+            {
+              identifier = sscanf(buffer, "%99[^[][%d]", prefix, &airport_id);
+              rio_writen(newfd, prefix, strlen(prefix) + 1);
+              reads = rio_readlineb(&rio, buffer, MAXLINE);
+            };
+
+          }
+          identifier = sscanf(buffer, "%*[^[][%d]", &airport_id);
           AirportFDMap *entry;
           HASH_FIND_INT(airport_fd_map, &airport_id, entry); 
           if (entry->airport_fd == max_fd)
@@ -261,6 +275,8 @@ void controller_server_loop(void) {
             max_fd = get_max_fd(&all_fds, max_fd);
           }
           close_airport_fd(airport_id, all_fds);
+          
+          
           // close(open_fd);   // Close the file descriptor
           // FD_CLR(open_fd, &all_fds); 
           break;
