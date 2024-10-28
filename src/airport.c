@@ -1,5 +1,4 @@
 #include "airport.h"
-#include "requests.h"
 
 /** This is the main file in which you should implement the airport server code.
  *  There are many functions here which are pre-written for you. You should read
@@ -144,106 +143,85 @@ void initialise_node(int airport_id, int num_gates, int listenfd) {
   airport_node_loop(listenfd);
 }
 
-int handle_client(int client_fd)
-{
-  // char buffer[MAXLINE];
+int handle_client(int client_fd) {
   rio_t rio;
   rio_readinitb(&rio, client_fd);
   request_t req;
   rio_readnb(&rio, &req, sizeof(request_t));  // Read the entire structure
+  response_t response;
+  response.airport_id = AIRPORT_ID;
 
-  // Initialise the rio_t structure
-  // rio_readinitb(&rio, client_fd);
-
-  // read data from the client, one line
-  // ssize_t read_size;
-  // while ((read_size = rio_readlineb(&rio, buffer, MAXLINE)) > 0)
-  // {
-    // read_size = rio_readlineb(&rio, buffer, MAXLINE);
-    // Print the received command
-  switch (req.type) {
+  switch (req.type)
+  {
     case SCHEDULE_REQUEST:
-    // TODO: CURRENT CODE DOES NOT CHECK FOR existing flights (must be added)
-      printf("Request type: SCHEDULE_REQUEST\n");
+      response.type = SCHEDULE_RESPONSE;
+
       int pl_id = req.data.schedule.plane_id;
       int er_time = req.data.schedule.earliest_time;
       int dur = req.data.schedule.duration;
       int fuel = req.data.schedule.fuel;
+
       time_info_t schedule = schedule_plane(pl_id, er_time, dur, fuel);
       if (schedule.gate_number != -1 && schedule.start_time != -1 && schedule.end_time != -1)
       {
-        char response[100];
-        sprintf(response, "SCHEDULED %d at GATE %d : %02d:%02d-%02d:%02d[%d]\n", pl_id, schedule.gate_number,
-                IDX_TO_HOUR(schedule.start_time), IDX_TO_MINS(schedule.start_time), IDX_TO_HOUR(schedule.end_time), IDX_TO_MINS(schedule.end_time), AIRPORT_ID);
-        // printf("response: %s", response);
-        rio_writen(client_fd, response, strlen(response) + 1);
+        response.data.schedule.success = true;
+        response.data.schedule.plane_id = pl_id;
+        response.data.schedule.gate_num = schedule.gate_number;
+        response.data.schedule.start_time = schedule.start_time;
+        response.data.schedule.end_time = schedule.end_time;
       } else
       {
-        char response[100];
-        sprintf(response, "Error: Cannot schedule %d[%d]\n", pl_id, AIRPORT_ID);
-        rio_writen(client_fd, response, strlen(response) + 1);
+        response.data.schedule.success = false;
       }
       break;
     case PLANE_STATUS_REQUEST:
-      printf("Request type: PLANE_STATUS_REQUEST\n");
+      response.type = PLANE_STATUS_RESPONSE;
+
       pl_id = req.data.plane_status.plane_id;
       time_info_t status = lookup_plane_in_airport(pl_id);
       if (status.gate_number != -1 && status.start_time != -1 && status.end_time != -1)
       {
-        char response[100];
-        sprintf(response, "PLANE %d scheduled at GATE %d: %02d:%02d-%02d:%02d[%d]\n", pl_id, status.gate_number,
-                IDX_TO_HOUR(status.start_time), IDX_TO_MINS(status.start_time), IDX_TO_HOUR(status.end_time), IDX_TO_MINS(status.end_time), AIRPORT_ID);
-        rio_writen(client_fd, response, strlen(response) + 1);
+        response.data.plane_status.scheduled = true;
+        response.data.plane_status.plane_id = pl_id;
+        response.data.plane_status.gate_num = status.gate_number;
+        response.data.plane_status.start_time = status.start_time;
+        response.data.plane_status.end_time = status.end_time;
       } else
       {
-        char response[100];
-        sprintf(response, "Error: Cannot schedule %d[%d]\n", pl_id, AIRPORT_ID);
-        rio_writen(client_fd, response, strlen(response) + 1);
+        response.data.plane_status.scheduled = false;
       }
       break;
     case TIME_STATUS_REQUEST:
-      printf("Request type: TIME_STATUS_REQUEST\n");
+      response.type = TIME_STATUS_RESPONSE;
       int gate_num = req.data.time_status.gate_num;
       int start_idx = req.data.time_status.start_idx;
       dur = req.data.time_status.duration;
-      char response[MAXLINE] = "";
       gate_t *gate = get_gate_by_idx(gate_num);
-      for (int i = start_idx; i <= (start_idx + dur); i ++)
+
+      response.data.time_status.num_idxs = dur + 1;
+      for (int i = start_idx; i <= (start_idx + dur); i++)
       {
         time_slot_t *slot = get_time_slot_by_idx(gate, i);
-        int status = check_time_slots_free(gate, i, i);
-        int len = strlen(response);
-        if (i == (start_idx + dur))
-        {
-          sprintf(response + len, "AIRPORT %d GATE %d %02d:%02d: %c - %d[%d]\n", AIRPORT_ID, i, IDX_TO_HOUR(i),
-                IDX_TO_MINS(i), status ? 'F' : 'A', status ? 0 : slot->plane_id, AIRPORT_ID);
-        } else
-        {
-          sprintf(response + len, "AIRPORT %d GATE %d %02d:%02d: %c - %d\n", AIRPORT_ID, i, IDX_TO_HOUR(i),
-                IDX_TO_MINS(i), status ? 'F' : 'A', status ? 0 : slot->plane_id);
-        }
-      }
-      rio_writen(client_fd, response, strlen(response) + 1);
-      break;
-    default:
-      printf("Unknown request type\n");
-  };
-  // }
+        (response.data.time_status.idxs)[i - start_idx] = i;
 
-  // if (read_size < 0)
-  // {
-  //   perror("Rio read error");
-  // }
+        int status = check_time_slots_free(gate, i, i);
+        response.data.time_status.statuses[i - start_idx] = status ? 'F' : 'A';
+
+        response.data.time_status.pl_ids[i - start_idx] = status ? 0 : slot->plane_id;
+      }
+      break;
+  }
+  rio_writen(client_fd, &response, sizeof(response));
 }
 
 void airport_node_loop(int listenfd) {
   struct sockaddr_in client_addr;
   socklen_t client_len = sizeof(client_addr);
-  int client_fd, res;
-
+  int client_fd;
   while (1)
   {
-    if ((client_fd = accept(listenfd, (SA *)&client_addr, &client_len)) < 0) {
+    if ((client_fd = accept(listenfd, (SA *)&client_addr, &client_len)) < 0)
+    {
       perror("accept");
       exit(1);
     }
