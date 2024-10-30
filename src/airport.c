@@ -149,7 +149,7 @@ int handle_client(int client_fd) {
   request_t req;
   rio_readnb(&rio, &req, sizeof(request_t));  // Read the entire structure
   response_t response;
-  response.airport_id = AIRPORT_ID;
+  response.airport_id = AIRPORT_ID; // TODO : RETURN THE AIRPORT FD
 
   switch (req.type)
   {
@@ -226,7 +226,18 @@ void airport_node_loop(int listenfd) {
       exit(1);
     }
 
+    // Check if the connecting client is the controller
+    // if (client_addr.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
+    // {
+    //   // Not from localhost, send error and close
+    //   char error_msg[] = "No direct communication to airport allowed.\n";
+    //   rio_writen(client_fd, error_msg, strlen(error_msg) + 1);
+    //   close(client_fd);
+    //   continue;
+    // }
+
     // Handle the request from the client
+    
     handle_client(client_fd);
 
     //close

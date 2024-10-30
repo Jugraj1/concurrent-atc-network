@@ -34,61 +34,25 @@ typedef struct controller_params_t {
 
 controller_params_t ATC_INFO;
 
-// Define a structure for the hash table
 typedef struct {
-    int airport_id;    // Airport identifier
     int airport_fd;    // File descriptor for the airport
+    int client_fd;     // File descriptor for the client
     UT_hash_handle hh; // Makes this structure hashable
-} AirportFDMap;
+} AirportClientMap;
 
-AirportFDMap *airport_id_map = NULL;  // Primary Hash table pointer
-AirportFDMap *airport_fd_map = NULL;  // Secondary Hash table pointer
+AirportClientMap *airport_client_map = NULL;  // Hash table pointer
 
-void add_airport_fd(int airport_id, int airport_fd) {
-    AirportFDMap *id_entry = malloc(sizeof(AirportFDMap));
-    id_entry->airport_id = airport_id;
-    id_entry->airport_fd = airport_fd;
-    HASH_ADD_INT(airport_id_map, airport_id, id_entry);
-
-    // Create and add entry for airport_fd_map
-    AirportFDMap *fd_entry = malloc(sizeof(AirportFDMap));
-    fd_entry->airport_id = airport_id;
-    fd_entry->airport_fd = airport_fd;
-    HASH_ADD_INT(airport_fd_map, airport_fd, fd_entry);
+void add_airport_client_fd(int airport_fd, int client_fd) {
+    AirportClientMap *entry = malloc(sizeof(AirportClientMap));
+    entry->airport_fd = airport_fd;
+    entry->client_fd = client_fd;
+    HASH_ADD_INT(airport_client_map, airport_fd, entry);
 }
 
-void close_airport_fd(int airport_id, fd_set all_fds) {
-    // Remove from airport_id_map
-    AirportFDMap *id_entry;
-    HASH_FIND_INT(airport_id_map, &airport_id, id_entry);
-    if (id_entry) {
-        printf("Closing connection for airport id %d (fd: %d).\n", airport_id, id_entry->airport_fd);
-        
-        // Remove from airport_fd_map by finding entry with airport_fd
-        AirportFDMap *fd_entry;
-        HASH_FIND_INT(airport_fd_map, &(id_entry->airport_fd), fd_entry);
-        
-        // Close the file descriptor and remove from select set
-        close(id_entry->airport_fd);
-        FD_CLR(id_entry->airport_fd, &all_fds);
-
-        // Delete entries from both hash tables
-        HASH_DEL(airport_id_map, id_entry);
-        HASH_DEL(airport_fd_map, fd_entry);
-
-        // Free memory for both entries
-        free(id_entry);
-        free(fd_entry);
-    } else {
-        printf("Airport id %d not found in the map.\n", airport_id);
-    }
-}
-
-bool check_if_airport(int fd)
-{
-  AirportFDMap *entry;
-  HASH_FIND_INT(airport_fd_map, &fd, entry);
-  return (entry != NULL);
+bool check_if_airport(int fd) {
+    AirportClientMap *entry;
+    HASH_FIND_INT(airport_client_map, &fd, entry);
+    return (entry != NULL);
 }
 
 int get_max_fd(fd_set *set, int current_max) {
@@ -100,7 +64,6 @@ int get_max_fd(fd_set *set, int current_max) {
     }
     return max_fd;
 }
-
 
 /** @brief The main server loop of the controller.
  *
@@ -125,6 +88,7 @@ void controller_server_loop(void) {
     read_fds = all_fds;  // Copy the master set to the read set
 
     // Use select() to wait for activity on any of the file descriptors
+    printf("Waiting on select: \n");
     nready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
     if (nready == -1)
     {
@@ -161,12 +125,17 @@ void controller_server_loop(void) {
       {
         // Receive data from the client (Airplane / Airport)
         char buffer[MAXLINE];
+        memset(buffer, 0, MAXLINE);
+
         rio_t rio;
 
         // Initialise the rio_t structure
         rio_readinitb(&rio, i);
 
         ssize_t read_size;
+        char response[] = "HELLO\n";
+        rio_writen(i, &response, strlen(response) + 1);
+        continue;
 
         // Check if the client is an airport
         bool is_airport = check_if_airport(i);
@@ -174,6 +143,37 @@ void controller_server_loop(void) {
         if (!is_airport) // a request from client
         {
           read_size = rio_readlineb(&rio, buffer, MAXLINE); // buffer is a command now
+          // In the client disconnection handling code
+          if (read_size == 0) // END OF FILE
+          {
+              printf("Closing connection with the client: %d\n", i);
+
+              // Remove from select set and close fd
+              FD_CLR(i, &all_fds);
+              if (i == max_fd)
+              {
+                  max_fd = get_max_fd(&all_fds, max_fd);
+              }
+              close(i);
+
+              // Now, search for any airport_fd mapped to this client_fd
+              AirportClientMap *entry, *tmp;
+              HASH_ITER(hh, airport_client_map, entry, tmp) {
+                  if (entry->client_fd == i) {
+                      // Close airport_fd
+                      close(entry->airport_fd);
+                      FD_CLR(entry->airport_fd, &all_fds);
+                      if (entry->airport_fd == max_fd)
+                          max_fd = get_max_fd(&all_fds, max_fd);
+
+                      // Remove mapping
+                      HASH_DEL(airport_client_map, entry);
+                      free(entry);
+                  }
+              }
+
+              continue;
+          }
           if (read_size < 0)
           {
             perror("Rio read error");
@@ -304,7 +304,8 @@ void controller_server_loop(void) {
             }
 
             // ADD THIS AIRPORT TO THE HASHTABLE OF ACTIVE AIRPORTS
-            add_airport_fd(airport_id, airport_fd);
+            // add_airport_fd(airport_id, airport_fd);
+            add_airport_client_fd(airport_fd, i);  // 'i' is the client_fd
             FD_SET(airport_fd, &all_fds);
             if (airport_fd > max_fd)
             {
@@ -327,7 +328,32 @@ void controller_server_loop(void) {
           response_t response;
           rio_t rio;
           rio_readinitb(&rio, i);
-          rio_readnb(&rio, &response, sizeof(response));
+          int nread = rio_readnb(&rio, &response, sizeof(response));
+
+          if (nread < 0) {
+              // if (nread == 0) {
+              //     printf("Airport fd %d closed connection\n", i);
+              // } else {
+              //     perror("rio_readnb");
+              // }
+
+              // Close airport_fd and remove from select set
+              close(i);
+              FD_CLR(i, &all_fds);
+              if (i == max_fd)
+                  max_fd = get_max_fd(&all_fds, max_fd);
+
+              // Remove mapping if any
+              AirportClientMap *entry;
+              HASH_FIND_INT(airport_client_map, &i, entry); // 'i' is the airport_fd
+              if (entry) {
+                  HASH_DEL(airport_client_map, entry);
+                  free(entry);
+              }
+
+              continue;
+          }
+
           char str_response[MAXLINE];
           bool success;
           int pl_id, air_num, gate_num, start_time, end_time, num_idxs;
@@ -371,7 +397,7 @@ void controller_server_loop(void) {
               int *idxs = response.data.time_status.idxs;
               char *statuses = response.data.time_status.statuses;
               int *pl_ids = response.data.time_status.pl_ids;
-              memset(str_response, 0, sizeof(str_response)); //initialise the string
+              memset(str_response, 0, sizeof(str_response)); //initialise the
               for (int i=0; i < num_idxs; i++)
               {
                 sprintf(str_response + strlen(str_response), "AIRPORT %d GATE %d %02d:%02d: %c - %d\n",
@@ -380,16 +406,26 @@ void controller_server_loop(void) {
               break;
           }
 
-          rio_writen(newfd, str_response, strlen(str_response) + 1);
+          AirportClientMap *entry_a_c_map;
+          HASH_FIND_INT(airport_client_map, &i, entry_a_c_map); // 'i' is the airport_fd
+          if (entry_a_c_map) {
+              int client_fd = entry_a_c_map->client_fd;
 
-          AirportFDMap *entry;
-          HASH_FIND_INT(airport_id_map, &response.airport_id, entry); 
-          if (entry->airport_fd == max_fd)
-          {
-            max_fd = get_max_fd(&all_fds, max_fd);
+              // Send response to the client
+              rio_writen(client_fd, str_response, strlen(str_response) + 1);
+
+              // Remove the mapping and clean up
+              HASH_DEL(airport_client_map, entry_a_c_map);
+              free(entry_a_c_map);
+              close(i);
+              FD_CLR(i, &all_fds);
+              if (i == max_fd) {
+                  max_fd = get_max_fd(&all_fds, max_fd);
+              }
+          } else {
+              // Handle error: mapping not found
+              fprintf(stderr, "Error: No client mapping found for airport_fd %d\n", i);
           }
-
-          close_airport_fd(response.airport_id, all_fds);
         }
       }
     }
