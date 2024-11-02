@@ -8,12 +8,13 @@
 #include <unistd.h>
 
 #include "airport.h"
-#include "uthash.h"
 
 #define PORT_STRLEN 6
 #define DEFAULT_PORTNUM 1024
 #define MIN_PORTNUM 1024
 #define MAX_PORTNUM 65535
+
+#define THREAD_POOL_SIZE 10 
 
 /** Struct that contains information associated with each airport node. */
 typedef struct airport_node_info {
@@ -34,36 +35,83 @@ typedef struct controller_params_t {
 
 controller_params_t ATC_INFO;
 
-typedef struct {
-    int airport_fd;    // File descriptor for the airport
-    int client_fd;     // File descriptor for the client
-    UT_hash_handle hh; // Makes this structure hashable
-} AirportClientMap;
+// Queue node for handling client connections
+typedef struct connection_node {
+  int connfd;
+  struct connection_node *next;
+} connection_node_t;
 
-AirportClientMap *airport_client_map = NULL;  // Hash table pointer
+// Queue to hold client connections
+typedef struct connection_queue {
+  connection_node_t *head; // first node in the queue
+  connection_node_t *tail; // last node in the queue (for inserting new clients)
+  pthread_mutex_t lock;
+  pthread_cond_t cond;     // condition var to notify worker threads
+} connection_queue_t;
 
-void add_airport_client_fd(int airport_fd, int client_fd) {
-    AirportClientMap *entry = malloc(sizeof(AirportClientMap));
-    entry->airport_fd = airport_fd;
-    entry->client_fd = client_fd;
-    HASH_ADD_INT(airport_client_map, airport_fd, entry);
+connection_queue_t connection_queue = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+
+// fixed thread pool
+pthread_t thread_pool[THREAD_POOL_SIZE];
+
+/** Adds a new connection to the queue
+*/
+void enqueue_connection(int connfd) {
+  connection_node_t *node = malloc(sizeof(connection_node_t));
+  node->connfd = connfd;
+  node->next = NULL;
+
+  pthread_mutex_lock(&connection_queue.lock);
+  if (connection_queue.tail == NULL) { //signifies that the queue is initially empty
+    connection_queue.head = connection_queue.tail = node;
+  } else {
+    connection_queue.tail->next = node;
+    connection_queue.tail = node;
+  }
+  pthread_cond_signal(&connection_queue.cond);  //signal worker threads that a new connection is available
+  pthread_mutex_unlock(&connection_queue.lock);
 }
 
-bool check_if_airport(int fd) {
-    AirportClientMap *entry;
-    HASH_FIND_INT(airport_client_map, &fd, entry);
-    return (entry != NULL);
-}
-
-int get_max_fd(fd_set *set, int current_max) {
-    int max_fd = -1;
-    for (int fd = 0; fd < current_max; fd++) {
-        if (FD_ISSET(fd, set)) {
-            max_fd = fd > max_fd ? fd : max_fd;
-        }
+/** Retrieves a connection from the queue
+*/
+int dequeue_connection() {
+    pthread_mutex_lock(&connection_queue.lock);
+    while (connection_queue.head == NULL) {  // Wait for a connection if the queue is empty
+        pthread_cond_wait(&connection_queue.cond, &connection_queue.lock);
     }
-    return max_fd;
+
+    connection_node_t *node = connection_queue.head;
+    int connfd = node->connfd;
+    connection_queue.head = node->next;
+    if (connection_queue.head == NULL) {
+        connection_queue.tail = NULL;
+    }
+    free(node);
+    pthread_mutex_unlock(&connection_queue.lock);
+    return connfd;
 }
+
+void handle_client_request(int connfd) {
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "Hello from ATC controller!\n");
+    rio_writen(connfd, buffer, strlen(buffer));
+}
+
+
+void *worker_thread(void *arg) {
+    while (1) {
+        // get a connection if available
+        int connfd = dequeue_connection();
+        if (connfd < 0) continue;
+
+        // Handle the client request 
+        handle_client_request(connfd);
+
+        close(connfd);  // Close the connection after handling the request
+    }
+    return NULL;
+}
+
 
 /** @brief The main server loop of the controller.
  *
@@ -71,365 +119,22 @@ int get_max_fd(fd_set *set, int current_max) {
  */
 void controller_server_loop(void) {
   int listenfd = ATC_INFO.listenfd;
-  fd_set all_fds, read_fds;
-  struct sockaddr_in client_addr;
-  socklen_t client_len = sizeof(client_addr);
-  // To keep track of the highest file descriptor
-  int max_fd = listenfd;
-  int newfd;              // New socket descriptor for accepted connection
-  int nready;             // Number of file descriptors ready for reading
-  // char buffer[256];       // Buffer to hold received data
-  int i, n;
-
-  FD_ZERO(&all_fds);           // Initialize the master set
-  FD_SET(listenfd, &all_fds);  // Add listenfd to the set
-  while (1)
-  {
-    read_fds = all_fds;  // Copy the master set to the read set
-
-    // Use select() to wait for activity on any of the file descriptors
-    printf("Waiting on select: \n");
-    nready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
-    if (nready == -1)
-    {
-      perror("select");
-      exit(1);
-    }
-
-    // Check if there is an incoming connection on the listening socket
-    if (FD_ISSET(listenfd, &read_fds))
-    {
-      // Accept new connection
-      newfd = accept(listenfd, (struct sockaddr *)&client_addr, &client_len);
-      if (newfd == -1)
-      {
-        perror("accept");
-        continue;
-      }
-
-      // Add the new socket to the set of all file descriptors
-      FD_SET(newfd, &all_fds);
-      if (newfd > max_fd)
-      {
-        max_fd = newfd;  // Update max_fd if necessary
-      }
-
-      // Log the connection (you can print client info or airport node ID)
-      printf("Controller: Accepted new connection on fd %d\n", newfd);
-    }
-
-    // Check all connected clients for incoming data
-    for (i = 0; i <= max_fd; i++)
-    {
-      if (i != listenfd && FD_ISSET(i, &read_fds))
-      {
-        // Receive data from the client (Airplane / Airport)
-        char buffer[MAXLINE];
-        memset(buffer, 0, MAXLINE);
-
-        rio_t rio;
-
-        // Initialise the rio_t structure
-        rio_readinitb(&rio, i);
-
-        ssize_t read_size;
-        char response[] = "HELLO\n";
-        rio_writen(i, &response, strlen(response) + 1);
-        continue;
-
-        // Check if the client is an airport
-        bool is_airport = check_if_airport(i);
-
-        if (!is_airport) // a request from client
-        {
-          read_size = rio_readlineb(&rio, buffer, MAXLINE); // buffer is a command now
-          // In the client disconnection handling code
-          if (read_size == 0) // END OF FILE
-          {
-              printf("Closing connection with the client: %d\n", i);
-
-              // Remove from select set and close fd
-              FD_CLR(i, &all_fds);
-              if (i == max_fd)
-              {
-                  max_fd = get_max_fd(&all_fds, max_fd);
-              }
-              close(i);
-
-              // Now, search for any airport_fd mapped to this client_fd
-              AirportClientMap *entry, *tmp;
-              HASH_ITER(hh, airport_client_map, entry, tmp) {
-                  if (entry->client_fd == i) {
-                      // Close airport_fd
-                      close(entry->airport_fd);
-                      FD_CLR(entry->airport_fd, &all_fds);
-                      if (entry->airport_fd == max_fd)
-                          max_fd = get_max_fd(&all_fds, max_fd);
-
-                      // Remove mapping
-                      HASH_DEL(airport_client_map, entry);
-                      free(entry);
-                  }
-              }
-
-              continue;
-          }
-          if (read_size < 0)
-          {
-            perror("Rio read error");
-          }
-          //Check one of the three cmds only
-          char first_word[30];
-          int airport_num;
-
-          // Use sscanf to read the first word from the buffer without modifying it
-          int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
-          if (matched != 2)
-          {
-            char message[] = "Error: Invalid request provided\n";
-            rio_writen(i, message, strlen(message) + 1);
-            continue;
-          }
-
-          request_t req; //req being sent to the airport
-          if (strncasecmp(first_word, "SCHEDULE", 8) == 0)
-          {
-            req.type = SCHEDULE_REQUEST;
-            int plane_id, earliest_time, duration, fuel;
-            // Use sscanf to check if the request matches the expected format
-            int matched = sscanf(buffer, "%s %d %d %d %d %d", first_word, &airport_num, &plane_id, &earliest_time, &duration, &fuel);
-            if (matched == 6)
-            {
-              req.data.schedule.plane_id = plane_id;
-              req.data.schedule.earliest_time = earliest_time;
-              req.data.schedule.duration = duration;
-              req.data.schedule.fuel = fuel;
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
-              continue;
-            }
-
-            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
-            {
-              char response[100];
-              sprintf(response, "Airport %d does not exist\n", airport_num);
-              rio_writen(i, response, strlen(response) + 1);
-              continue;
-            }
-            
-          } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
-          {
-            req.type = PLANE_STATUS_REQUEST;
-            int plane_id;
-            int matched = sscanf(buffer, "%s %d %d", first_word, &airport_num, &plane_id);
-            if (matched == 3)
-            {
-              req.data.plane_status.plane_id = plane_id;
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
-              continue;
-            }
-            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
-            {
-              char response[100];
-              sprintf(response, "Airport %d does not exist\n", airport_num);
-              rio_writen(i, response, strlen(response) + 1);
-              continue;
-            }
-
-          } else if (strncasecmp(first_word, "TIME_STATUS", 11) == 0)
-          {
-            req.type = TIME_STATUS_REQUEST;
-            int gate_num, start_idx, duration;
-            int matched = sscanf(buffer, "%s %d %d %d %d", first_word, &airport_num, &gate_num, &start_idx, &duration);
-            if (matched == 5)
-            {
-              req.data.time_status.gate_num = gate_num;
-              req.data.time_status.start_idx = start_idx;
-              req.data.time_status.duration = duration;
-            } else
-            {
-              char message[] = "Error: Invalid request provided\n";
-              rio_writen(i, message, strlen(message) + 1);
-              continue;
-            }
-            if (airport_num >= ATC_INFO.num_airports || airport_num < 0)
-            {
-              char response[100];
-              sprintf(response, "Airport %d does not exist\n", airport_num);
-              rio_writen(i, response, strlen(response) + 1);
-              continue;
-            }
-
-          } else 
-          {
-            char message[] = "Error: Invalid request provided\n";
-            rio_writen(i, message, strlen(message) + 1);
-            continue;
-          }
-
-          // Forward the above received request to the specific airport
-          node_info_t *airport_nodes = ATC_INFO.airport_nodes;
-          int total_air = ATC_INFO.num_airports;
-
-          for (int j = 0; j < total_air; j++)
-          {
-            int airport_id = airport_nodes[j].id;
-            if (airport_id != airport_num)
-            {
-              continue;
-            }
-            int airport_port = airport_nodes[j].port;
-            int airport_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (airport_fd < 0)
-            {
-              perror("socket");
-              continue;
-            }
-            struct sockaddr_in airport_addr;
-            memset(&airport_addr, 0, sizeof(airport_addr));
-            airport_addr.sin_family = AF_INET;
-            airport_addr.sin_port = htons(airport_port);
-            airport_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); //Assuming local host
-
-            if (connect(airport_fd, (struct sockaddr *)&airport_addr, sizeof(airport_addr)) < 0)
-            {
-              perror("connect");
-              close(airport_fd);
-              continue;
-            }
-
-            // ADD THIS AIRPORT TO THE HASHTABLE OF ACTIVE AIRPORTS
-            // add_airport_fd(airport_id, airport_fd);
-            add_airport_client_fd(airport_fd, i);  // 'i' is the client_fd
-            FD_SET(airport_fd, &all_fds);
-            if (airport_fd > max_fd)
-            {
-              max_fd = airport_fd;  // Update max_fd if necessary
-            }
-
-            // Send data to airport using rio
-            int write_num = rio_writen(airport_fd, &req, sizeof(request_t));
-            if (write_num == -1)
-            {
-              perror("send");
-            }
-            break;
-          }
-
-        } else
-        {
-          // It is an airport responding back
-          printf("Airport is trynna respond back\n");
-          response_t response;
-          rio_t rio;
-          rio_readinitb(&rio, i);
-          int nread = rio_readnb(&rio, &response, sizeof(response));
-
-          if (nread < 0) {
-              // if (nread == 0) {
-              //     printf("Airport fd %d closed connection\n", i);
-              // } else {
-              //     perror("rio_readnb");
-              // }
-
-              // Close airport_fd and remove from select set
-              close(i);
-              FD_CLR(i, &all_fds);
-              if (i == max_fd)
-                  max_fd = get_max_fd(&all_fds, max_fd);
-
-              // Remove mapping if any
-              AirportClientMap *entry;
-              HASH_FIND_INT(airport_client_map, &i, entry); // 'i' is the airport_fd
-              if (entry) {
-                  HASH_DEL(airport_client_map, entry);
-                  free(entry);
-              }
-
-              continue;
-          }
-
-          char str_response[MAXLINE];
-          bool success;
-          int pl_id, air_num, gate_num, start_time, end_time, num_idxs;
-          air_num = response.airport_id;
-
-          switch (response.type)
-          {
-            case SCHEDULE_RESPONSE:
-              success = response.data.schedule.success;
-              pl_id = response.data.schedule.plane_id;
-              if (response.data.schedule.success)
-              {
-                gate_num = response.data.schedule.gate_num;
-                start_time = response.data.schedule.start_time;
-                end_time = response.data.schedule.end_time;
-                sprintf(str_response, "SCHEDULED %d at GATE %d: %02d:%02d-%02d:%02d\n", pl_id, gate_num,
-                        IDX_TO_HOUR(start_time), IDX_TO_MINS(start_time), IDX_TO_HOUR(end_time), IDX_TO_MINS(end_time));
-              } else
-              {
-                sprintf(str_response, "Error: Cannot schedule %d\n", pl_id);
-              }
-              break;
-            case PLANE_STATUS_RESPONSE:
-              success = response.data.plane_status.scheduled;
-
-              if (success)
-              {
-                gate_num = response.data.plane_status.gate_num;
-                start_time = response.data.plane_status.start_time;
-                end_time = response.data.plane_status.end_time;
-                sprintf(str_response, "PLANE %d scheduled at GATE %d: %02d:%02d-%02d:%02d\n", pl_id, gate_num,
-                        IDX_TO_HOUR(start_time), IDX_TO_MINS(start_time), IDX_TO_HOUR(end_time), IDX_TO_MINS(end_time));
-              } else
-              {
-                sprintf(str_response, "PLANE %d not scheduled at airport %d\n", pl_id, air_num);
-              }
-              break;
-            case TIME_STATUS_RESPONSE:
-              // str_response[MAXLINE];
-              num_idxs = response.data.time_status.num_idxs;
-              int *idxs = response.data.time_status.idxs;
-              char *statuses = response.data.time_status.statuses;
-              int *pl_ids = response.data.time_status.pl_ids;
-              memset(str_response, 0, sizeof(str_response)); //initialise the
-              for (int i=0; i < num_idxs; i++)
-              {
-                sprintf(str_response + strlen(str_response), "AIRPORT %d GATE %d %02d:%02d: %c - %d\n",
-                        air_num, idxs[i], IDX_TO_HOUR(idxs[i]), IDX_TO_MINS(idxs[i]), statuses[i], pl_ids[i]);
-              }
-              break;
-          }
-
-          AirportClientMap *entry_a_c_map;
-          HASH_FIND_INT(airport_client_map, &i, entry_a_c_map); // 'i' is the airport_fd
-          if (entry_a_c_map) {
-              int client_fd = entry_a_c_map->client_fd;
-
-              // Send response to the client
-              rio_writen(client_fd, str_response, strlen(str_response) + 1);
-
-              // Remove the mapping and clean up
-              HASH_DEL(airport_client_map, entry_a_c_map);
-              free(entry_a_c_map);
-              close(i);
-              FD_CLR(i, &all_fds);
-              if (i == max_fd) {
-                  max_fd = get_max_fd(&all_fds, max_fd);
-              }
-          } else {
-              // Handle error: mapping not found
-              fprintf(stderr, "Error: No client mapping found for airport_fd %d\n", i);
-          }
-        }
-      }
-    }
+  // Initialize thread pool
+  for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+    pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
+    // Detach threads
+    pthread_detach(thread_pool[i]);
   }
+  // Main server loop
+    while (1) {
+        int connfd = accept(listenfd, NULL, NULL);  // Accept a new client connection
+        if (connfd < 0) {
+            perror("accept");
+            continue;
+        }
+
+        enqueue_connection(connfd);  // Add the connection to the queue for workers to process
+    }
 }
 
 /** @brief A handler for reaping child processes (individual airport nodes).

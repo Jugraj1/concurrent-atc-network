@@ -1,5 +1,7 @@
 #include "airport.h"
 
+#define AIRPORT_THREAD_POOL_SIZE 10
+
 /** This is the main file in which you should implement the airport server code.
  *  There are many functions here which are pre-written for you. You should read
  *  the comments in the corresponding `airport.h` header file to understand what
@@ -10,6 +12,25 @@
  *  in airport nodes in this file. You are also permitted to modify the
  *  functions you have been given if needed.
  */
+
+// Queue node for handling controller requests
+typedef struct request_node {
+    int connfd;
+    struct request_node *next;
+} request_node_t;
+
+// Queue to hold incoming requests
+typedef struct request_queue {
+    request_node_t *head;
+    request_node_t *tail;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} request_queue_t;
+
+request_queue_t request_queue = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+
+// Thread pool for the airport node
+pthread_t airport_thread_pool[AIRPORT_THREAD_POOL_SIZE];
 
 /* This will be set by the `initialise_node` function. */
 static int AIRPORT_ID = -1;
@@ -143,104 +164,82 @@ void initialise_node(int airport_id, int num_gates, int listenfd) {
   airport_node_loop(listenfd);
 }
 
-int handle_client(int client_fd) {
-  rio_t rio;
-  rio_readinitb(&rio, client_fd);
-  request_t req;
-  rio_readnb(&rio, &req, sizeof(request_t));  // Read the entire structure
-  response_t response;
-  response.airport_id = AIRPORT_ID; // TODO : RETURN THE AIRPORT FD
+/** Add a new request to the queue
+*/
+void enqueue_request(int connfd) {
+    request_node_t *node = malloc(sizeof(request_node_t));
+    node->connfd = connfd;
+    node->next = NULL;
 
-  switch (req.type)
-  {
-    case SCHEDULE_REQUEST:
-      response.type = SCHEDULE_RESPONSE;
+    pthread_mutex_lock(&request_queue.lock);
+    if (request_queue.tail == NULL) {
+        request_queue.head = request_queue.tail = node;
+    } else {
+        request_queue.tail->next = node;
+        request_queue.tail = node;
+    }
+    pthread_cond_signal(&request_queue.cond);  // Notify worker threads
+    pthread_mutex_unlock(&request_queue.lock);
+}
 
-      int pl_id = req.data.schedule.plane_id;
-      int er_time = req.data.schedule.earliest_time;
-      int dur = req.data.schedule.duration;
-      int fuel = req.data.schedule.fuel;
+/** Process a request from the queue
+*/
+int dequeue_request() {
+    pthread_mutex_lock(&request_queue.lock);
+    while (request_queue.head == NULL) {  // Wait if the queue is empty
+        pthread_cond_wait(&request_queue.cond, &request_queue.lock);
+    }
 
-      time_info_t schedule = schedule_plane(pl_id, er_time, dur, fuel);
-      if (schedule.gate_number != -1 && schedule.start_time != -1 && schedule.end_time != -1)
-      {
-        response.data.schedule.success = true;
-        response.data.schedule.plane_id = pl_id;
-        response.data.schedule.gate_num = schedule.gate_number;
-        response.data.schedule.start_time = schedule.start_time;
-        response.data.schedule.end_time = schedule.end_time;
-      } else
-      {
-        response.data.schedule.success = false;
-      }
-      break;
-    case PLANE_STATUS_REQUEST:
-      response.type = PLANE_STATUS_RESPONSE;
+    request_node_t *node = request_queue.head;
+    int connfd = node->connfd;
+    request_queue.head = node->next;
+    if (request_queue.head == NULL) {
+        request_queue.tail = NULL;
+    }
+    free(node);
+    pthread_mutex_unlock(&request_queue.lock);
+    return connfd;
+}
 
-      pl_id = req.data.plane_status.plane_id;
-      time_info_t status = lookup_plane_in_airport(pl_id);
-      if (status.gate_number != -1 && status.start_time != -1 && status.end_time != -1)
-      {
-        response.data.plane_status.scheduled = true;
-        response.data.plane_status.plane_id = pl_id;
-        response.data.plane_status.gate_num = status.gate_number;
-        response.data.plane_status.start_time = status.start_time;
-        response.data.plane_status.end_time = status.end_time;
-      } else
-      {
-        response.data.plane_status.scheduled = false;
-      }
-      break;
-    case TIME_STATUS_REQUEST:
-      response.type = TIME_STATUS_RESPONSE;
-      int gate_num = req.data.time_status.gate_num;
-      int start_idx = req.data.time_status.start_idx;
-      dur = req.data.time_status.duration;
-      gate_t *gate = get_gate_by_idx(gate_num);
+void handle_airport_request(int connfd) {
+    char buffer[256];
+    rio_t rio;
+    rio_readinitb(&rio, connfd);
+    ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
+    if (n > 0) {
+        printf("Received request: %s", buffer);
+        // for now, simply echo back the request
+        rio_writen(connfd, buffer, strlen(buffer));
+    }
+}
 
-      response.data.time_status.num_idxs = dur + 1;
-      for (int i = start_idx; i <= (start_idx + dur); i++)
-      {
-        time_slot_t *slot = get_time_slot_by_idx(gate, i);
-        (response.data.time_status.idxs)[i - start_idx] = i;
+void *airport_worker_thread(void *arg) {
+    while (1) {
+        // process a request
+        int connfd = dequeue_request();
+        if (connfd < 0) continue;
 
-        int status = check_time_slots_free(gate, i, i);
-        response.data.time_status.statuses[i - start_idx] = status ? 'F' : 'A';
+        handle_airport_request(connfd);
 
-        response.data.time_status.pl_ids[i - start_idx] = status ? 0 : slot->plane_id;
-      }
-      break;
-  }
-  rio_writen(client_fd, &response, sizeof(response));
+        // Close connection after processing the request
+        close(connfd);
+    }
+    return NULL;
 }
 
 void airport_node_loop(int listenfd) {
-  struct sockaddr_in client_addr;
-  socklen_t client_len = sizeof(client_addr);
-  int client_fd;
-  while (1)
-  {
-    if ((client_fd = accept(listenfd, (SA *)&client_addr, &client_len)) < 0)
-    {
-      perror("accept");
-      exit(1);
-    }
+  // Initialize the thread pool
+  for (int i = 0; i < AIRPORT_THREAD_POOL_SIZE; i++) {
+        pthread_create(&airport_thread_pool[i], NULL, airport_worker_thread, NULL);
+        pthread_detach(airport_thread_pool[i]);  // Detach threads to avoid memory leaks
+  }
+  while (1) {
+        int connfd = accept(listenfd, NULL, NULL);  // Accept a new connection
+        if (connfd < 0) {
+            perror("accept");
+            continue;
+        }
 
-    // Check if the connecting client is the controller
-    // if (client_addr.sin_addr.s_addr != htonl(INADDR_LOOPBACK))
-    // {
-    //   // Not from localhost, send error and close
-    //   char error_msg[] = "No direct communication to airport allowed.\n";
-    //   rio_writen(client_fd, error_msg, strlen(error_msg) + 1);
-    //   close(client_fd);
-    //   continue;
-    // }
-
-    // Handle the request from the client
-    
-    handle_client(client_fd);
-
-    //close
-    close(client_fd);
+        enqueue_request(connfd);  // Add the connection to the request queue for processing
   }
 }
