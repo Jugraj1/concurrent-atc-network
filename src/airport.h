@@ -76,6 +76,13 @@ struct time_info_t {
   int end_time;
 };
 
+// represents a single node in the queue for handling client connections
+typedef struct node
+{
+  int connfd;
+  struct node *next;
+} node_t;
+
 /** Helper functions and macros defined for you to use. */
 
 /** @brief Allocates sufficient memory for an airport struct containing all

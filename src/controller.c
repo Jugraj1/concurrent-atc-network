@@ -15,6 +15,7 @@
 #define MAX_PORTNUM 65535
 
 #define THREAD_POOL_SIZE 10 
+pthread_t thread_pool[THREAD_POOL_SIZE];
 
 /** Struct that contains information associated with each airport node. */
 typedef struct airport_node_info {
@@ -35,182 +36,199 @@ typedef struct controller_params_t {
 
 controller_params_t ATC_INFO;
 
-// Queue node for handling client connections
-typedef struct connection_node {
-  int connfd;
-  struct connection_node *next;
-} connection_node_t;
-
 // Queue to hold client connections
 typedef struct connection_queue {
-  connection_node_t *head; // first node in the queue
-  connection_node_t *tail; // last node in the queue (for inserting new clients)
+  node_t *head;             // first node in the queue
+  node_t *tail;             // last node in the queue (for inserting new clients)
   pthread_mutex_t lock;
-  pthread_cond_t cond;     // condition var to notify worker threads
+  pthread_cond_t cond;      // condition var to notify worker threads
 } connection_queue_t;
 
-connection_queue_t connection_queue = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+connection_queue_t connection_queue;
 
-// fixed thread pool
-pthread_t thread_pool[THREAD_POOL_SIZE];
+/** Initialises the queue
+*/
+void initialize_connection_queue() {
+  connection_queue.head = NULL;
+  connection_queue.tail = NULL;
+  pthread_mutex_init(&connection_queue.lock, NULL);
+  pthread_cond_init(&connection_queue.cond, NULL);
+}
 
 /** Adds a new connection to the queue
 */
-void enqueue_connection(int connfd) {
-  connection_node_t *node = malloc(sizeof(connection_node_t));
-  node->connfd = connfd;
-  node->next = NULL;
+void add_connection_fd(int connfd)
+{
+  node_t *new_node = malloc(sizeof(node_t));
+  new_node->connfd = connfd;
+  new_node->next = NULL;
 
-  pthread_mutex_lock(&connection_queue.lock);
-  if (connection_queue.tail == NULL) { //signifies that the queue is initially empty
-    connection_queue.head = connection_queue.tail = node;
-  } else {
-    connection_queue.tail->next = node;
-    connection_queue.tail = node;
+  // acquire lock to modify shared
+  pthread_mutex_lock(&connection_queue.lock); 
+  // if the queue is initially empty
+  if (connection_queue.tail == NULL)
+  {
+    connection_queue.head = new_node;
+    connection_queue.tail = new_node;
+  } else
+  {
+    connection_queue.tail->next = new_node;
+    connection_queue.tail = new_node;
   }
-  pthread_cond_signal(&connection_queue.cond);  //signal worker threads that a new connection is available
+
+  //signal worker threads that a new connection is available
+  pthread_cond_signal(&connection_queue.cond);
   pthread_mutex_unlock(&connection_queue.lock);
 }
 
 /** Retrieves a connection from the queue
 */
-int dequeue_connection() {
-    pthread_mutex_lock(&connection_queue.lock);
-    while (connection_queue.head == NULL) {  // Wait for a connection if the queue is empty
-        pthread_cond_wait(&connection_queue.cond, &connection_queue.lock);
-    }
+int remove_head_fd()
+{
+  pthread_mutex_lock(&connection_queue.lock);
+  // Wait for a connection if the queue is empty
+  // while loop used (reason as stated in ostep book)
+  while (connection_queue.head == NULL)
+  {
+    pthread_cond_wait(&connection_queue.cond, &connection_queue.lock);
+  }
 
-    connection_node_t *node = connection_queue.head;
-    int connfd = node->connfd;
-    connection_queue.head = node->next;
-    if (connection_queue.head == NULL) {
-        connection_queue.tail = NULL;
-    }
-    free(node);
-    pthread_mutex_unlock(&connection_queue.lock);
-    return connfd;
+  node_t *node = connection_queue.head;
+  int connfd = node->connfd;
+  connection_queue.head = node->next;
+  if (connection_queue.head == NULL)
+  {
+    connection_queue.tail = NULL;
+  }
+  free(node);
+  pthread_mutex_unlock(&connection_queue.lock);
+  return connfd;
 }
 
-void handle_client_request(int connfd) {
-    char buffer[256];
-    memset(buffer, '\0', sizeof(buffer));
+void request_handler(int connfd)
+{
+  char buffer[MAXLINE];
+  memset(buffer, '\0', sizeof(buffer));
 
-    printf("Client connected on connfd: %d\n", connfd);
+  // printf("Client connected on connfd: %d\n", connfd);
 
-    rio_t rio;
-    rio_readinitb(&rio, connfd);
-    while (1)
+  rio_t rio;
+  rio_readinitb(&rio, connfd);
+  while (1)
+  {
+    // printf("Waiting to read request.\n");
+    ssize_t read_size = rio_readlineb(&rio, buffer, sizeof(buffer));
+    // printf("Received request: %s\n", buffer);
+    if (read_size < 0)
     {
-      
-      
-      printf("Waiting to read request...\n");
-      ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
-      printf("Received request: %s\n", buffer);
-      if (n < 0) {
-            // If there's a read error, check if it’s recoverable (like interrupted system call)
-            if (errno == EINTR) {
-                continue;  // Interrupted by a signal, just try reading again
-            } else {
-                perror("Error reading from client");
-                break;  // Unrecoverable error, exit the loop
-            }
-      } else if (n == 0) {
-            // EOF detected, client has disconnected intentionally (e.g., Ctrl + D)
-            printf("EOF detected, closing connection\n");
-            break;
-      }
-      
-      // buffer[strcspn(buffer, "\n")] = '\0';
-      // Parse the command to determine the airport number
-      char command[20];
-      int airport_num;
-
-      // Check if the request format is valid and retrieve the airport number
-      if (sscanf(buffer, "%s %d", command, &airport_num) < 2) {
-            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
-            rio_writen(connfd, buffer, strlen(buffer));
-            printf("Invalid request format, sent error response\n");
-            continue;
-      }
-
-      int param1, param2, param3, param4, num_parsed;
-      if (strcmp(command, "SCHEDULE") == 0) {
-        num_parsed = sscanf(buffer, "%s %d %d %d %d", command, &param1, &param2, &param3, &param4);
-        if (num_parsed != 5) {
-            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
-            rio_writen(connfd, buffer, strlen(buffer));
-            continue;
-        }
-      } else if (strcmp(command, "PLANE_STATUS") == 0)
-      {
-        num_parsed = sscanf(buffer, "%s %d %d", command, &param1, &param2);
-        if (num_parsed != 3) {
-            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
-            rio_writen(connfd, buffer, strlen(buffer));
-            continue;
-        }
-      } else if ((strcmp(command, "TIME_STATUS") == 0))
-      {
-        num_parsed = sscanf(buffer, "%s %d %d %d", command, &param1, &param2, &param3);
-        if (num_parsed != 4) {
-            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
-            rio_writen(connfd, buffer, strlen(buffer));
-            continue;
-        }
-      }
-      // Validate airport number
-      if (airport_num < 0 || airport_num >= ATC_INFO.num_airports) {
-            snprintf(buffer, sizeof(buffer), "Error: Airport %d does not exist\n", airport_num);
-            rio_writen(connfd, buffer, strlen(buffer));
-            printf("Invalid airport number %d, sent error response\n", airport_num);
-            continue;
-      }
-
-        // Retrieve the port for the target airport node
-      int airport_port = ATC_INFO.airport_nodes[airport_num].port;
-      char port_str[PORT_STRLEN];
-      snprintf(port_str, sizeof(port_str), "%d", airport_port);
-
-      // Forward the request to the appropriate airport node
-      printf("Connecting to airport node %d on port %s...\n", airport_num, port_str);
-      int airport_connfd = open_clientfd("localhost", port_str);
-      if (airport_connfd < 0) {
-          snprintf(buffer, sizeof(buffer), "Error: Unable to connect to airport %d\n", airport_num);
-          rio_writen(connfd, buffer, strlen(buffer));
-          perror("Error connecting to airport node");
-          return;
-      }
-
-      // Forward the request to the airport node
-      printf("Forwarding request to airport node %d\n", airport_num);
-      rio_writen(airport_connfd, buffer, strlen(buffer));
-      // Receive the response from the airport node and send it back to the client
-      rio_t rio_air;
-      rio_readinitb(&rio_air, airport_connfd);
-      while ((n = rio_readlineb(&rio_air, buffer, sizeof(buffer))) > 0) {
-        printf("Received response from airport node: %s", buffer);
-        rio_writen(connfd, buffer, n);  // Write the response back to the client
-      }
-
-      close(airport_connfd);  // Close the connection to the airport node
-      printf("Closed connection to airport node %d\n", airport_num);
+      perror("Rio read error");
+    } else if (read_size == 0)
+    {
+      break; //EOF
     }
-    close(connfd);
-    printf("Client disconnected from connfd: %d\n", connfd);
-    
+      
+    //Check one of the three cmds only
+    char first_word[30];
+    int airport_num;
+
+
+    // Check if the request format is valid and retrieve the airport number
+    // Use sscanf to read the first word from the buffer without modifying it
+    int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
+
+    if (matched != 2)
+    {
+      snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+      rio_writen(connfd, buffer, strlen(buffer));
+      continue;
+    }
+
+    int param1, param2, param3, param4, num_parsed;
+    if (strncasecmp(first_word, "SCHEDULE", 8) == 0)
+    {
+      num_parsed = sscanf(buffer, "%s %d %d %d %d", first_word, &param1, &param2, &param3, &param4);
+      if (num_parsed != 5)
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+        rio_writen(connfd, buffer, strlen(buffer));
+        continue;
+      }
+    } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
+    {
+      num_parsed = sscanf(buffer, "%s %d %d", first_word, &param1, &param2);
+      if (num_parsed != 3)
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+        rio_writen(connfd, buffer, strlen(buffer));
+        continue;
+      }
+    } else if (strncasecmp(first_word, "TIME_STATUS", 11) == 0)
+    {
+      num_parsed = sscanf(buffer, "%s %d %d %d", first_word, &param1, &param2, &param3);
+      if (num_parsed != 4)
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+        rio_writen(connfd, buffer, strlen(buffer));
+        continue;
+      }
+    }
+      
+    // Validate airport number
+    if (airport_num < 0 || airport_num >= ATC_INFO.num_airports)
+    {
+      snprintf(buffer, sizeof(buffer), "Error: Airport %d does not exist\n", airport_num);
+      rio_writen(connfd, buffer, strlen(buffer));
+      printf("Invalid airport number %d, sent error response\n", airport_num);
+      continue;
+    }
+
+    // Retrieve the port for the target airport node
+    int airport_port = ATC_INFO.airport_nodes[airport_num].port;
+    char port_str[PORT_STRLEN];
+    snprintf(port_str, sizeof(port_str), "%d", airport_port);
+
+    // Forward the request to the appropriate airport node
+    // printf("Connecting to airport node %d on port %s...\n", airport_num, port_str);
+    int airport_connfd = open_clientfd("localhost", port_str);
+    if (airport_connfd < 0)
+    {
+      snprintf(buffer, sizeof(buffer), "Error: Unable to connect to airport %d\n", airport_num);
+      rio_writen(connfd, buffer, strlen(buffer));
+      perror("Error connecting to airport node");
+      return;
+    }
+
+    // Forward the request to the airport node
+    // printf("Forwarding request to airport node %d\n", airport_num);
+    rio_writen(airport_connfd, buffer, strlen(buffer));
+
+
+    // Receive the response from the airport node and send it back to the client
+    rio_t rio_air;
+    rio_readinitb(&rio_air, airport_connfd);
+    while ((read_size = rio_readlineb(&rio_air, buffer, sizeof(buffer))) > 0)
+    {
+      // printf("Received response from airport node: %s", buffer);
+      rio_writen(connfd, buffer, read_size);  // Write the response back to the client
+    }
+
+    close(airport_connfd);  // Close the connection to the airport node
+    // printf("Closed connection to airport node %d\n", airport_num);
+  }
+  close(connfd);
+  // printf("Client disconnected from connfd: %d\n", connfd);
 }
 
 
 void *worker_thread(void *arg) {
-    while (1) {
+    while (1)
+    {
         // get a connection if available
-        int connfd = dequeue_connection();
+        int connfd = remove_head_fd();
         if (connfd < 0) continue;
 
         // Handle the client request 
-        handle_client_request(connfd);
-
-        // close(connfd);  // Close the connection after handling the request
+        request_handler(connfd);
     }
     return NULL;
 }
@@ -220,24 +238,32 @@ void *worker_thread(void *arg) {
  *
  *  @todo  Implement this function!
  */
-void controller_server_loop(void) {
+void controller_server_loop(void)
+{
   int listenfd = ATC_INFO.listenfd;
-  // Initialize thread pool
+
+  // initialise the cond var and lk.
+  initialize_connection_queue();
+
+  // initialize thread pool
   for (int i = 0; i < THREAD_POOL_SIZE; i++) {
     pthread_create(&thread_pool[i], NULL, worker_thread, NULL);
     // Detach threads
     pthread_detach(thread_pool[i]);
   }
   // Main server loop
-    while (1) {
-        int connfd = accept(listenfd, NULL, NULL);  // Accept a new client connection
-        if (connfd < 0) {
-            perror("accept");
-            continue;
-        }
-
-        enqueue_connection(connfd);  // Add the connection to the queue for workers to process
+  while (1)
+  {
+    int connfd = accept(listenfd, NULL, NULL);  // Accept a new client connection
+    if (connfd < 0)
+    {
+      perror("accept");
+      continue;
     }
+
+    // Add the connection to the queue for workers to process
+    add_connection_fd(connfd);
+  }
 }
 
 /** @brief A handler for reaping child processes (individual airport nodes).
@@ -401,7 +427,8 @@ int parse_args(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-  setvbuf(stdout, NULL, _IONBF, 0);
+  // useful for seeing stdout in file
+  // setvbuf(stdout, NULL, _IONBF, 0); // set unbuffered
   if (parse_args(argc, argv) < 0)
     return 1;
   initialise_network();

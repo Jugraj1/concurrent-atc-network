@@ -13,21 +13,26 @@
  *  functions you have been given if needed.
  */
 
-// Queue node for handling controller requests
-typedef struct request_node {
-    int connfd;
-    struct request_node *next;
-} request_node_t;
-
 // Queue to hold incoming requests
-typedef struct request_queue {
-    request_node_t *head;
-    request_node_t *tail;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
+typedef struct request_queue
+{
+  node_t *head;
+  node_t *tail;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
 } request_queue_t;
 
-request_queue_t request_queue = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+request_queue_t request_queue;
+
+/** Initialises the queue
+*/
+void initialize_request_queue()
+{
+  request_queue.head = NULL;
+  request_queue.tail = NULL;
+  pthread_mutex_init(&request_queue.lock, NULL);
+  pthread_cond_init(&request_queue.cond, NULL);
+}
 
 // Thread pool for the airport node
 pthread_t airport_thread_pool[AIRPORT_THREAD_POOL_SIZE];
@@ -161,153 +166,194 @@ void initialise_node(int airport_id, int num_gates, int listenfd) {
   AIRPORT_DATA = create_airport(num_gates);
   if (AIRPORT_DATA == NULL)
     exit(1);
+  initialize_request_queue();
   airport_node_loop(listenfd);
 }
 
 /** Add a new request to the queue
 */
-void enqueue_request(int connfd) {
-    request_node_t *node = malloc(sizeof(request_node_t));
-    node->connfd = connfd;
-    node->next = NULL;
+void add_request_fd(int connfd)
+{
+  node_t *new_node = malloc(sizeof(node_t));
+  new_node->connfd = connfd;
+  new_node->next = NULL;
 
-    pthread_mutex_lock(&request_queue.lock);
-    if (request_queue.tail == NULL) {
-        request_queue.head = request_queue.tail = node;
-    } else {
-        request_queue.tail->next = node;
-        request_queue.tail = node;
-    }
-    pthread_cond_signal(&request_queue.cond);  // Notify worker threads
-    pthread_mutex_unlock(&request_queue.lock);
+  pthread_mutex_lock(&request_queue.lock);
+  if (request_queue.tail == NULL)
+  {
+    request_queue.head = new_node;
+    request_queue.tail = new_node;
+  } else
+  {
+    request_queue.tail->next = new_node;
+    request_queue.tail = new_node;
+  }
+  pthread_cond_signal(&request_queue.cond);  // Notify worker threads
+  pthread_mutex_unlock(&request_queue.lock);
 }
 
 /** Process a request from the queue
 */
-int dequeue_request() {
-    pthread_mutex_lock(&request_queue.lock);
-    while (request_queue.head == NULL) {  // Wait if the queue is empty
-        pthread_cond_wait(&request_queue.cond, &request_queue.lock);
-    }
+int remove_head_request_fd()
+{
+  pthread_mutex_lock(&request_queue.lock);
+  while (request_queue.head == NULL)
+  {  // Wait if the queue is empty
+    pthread_cond_wait(&request_queue.cond, &request_queue.lock);
+  }
 
-    request_node_t *node = request_queue.head;
-    int connfd = node->connfd;
-    request_queue.head = node->next;
-    if (request_queue.head == NULL) {
-        request_queue.tail = NULL;
-    }
-    free(node);
-    pthread_mutex_unlock(&request_queue.lock);
-    return connfd;
+  node_t *node = request_queue.head;
+  int connfd = node->connfd;
+  request_queue.head = node->next;
+  if (request_queue.head == NULL)
+  {
+    request_queue.tail = NULL;
+  }
+  free(node);
+  pthread_mutex_unlock(&request_queue.lock);
+  return connfd;
 }
 
 void handle_airport_request(int connfd) {
-    char buffer[256];
+    char buffer[MAXLINE];
+    memset(buffer, '\0', sizeof(buffer));
     rio_t rio;
     rio_readinitb(&rio, connfd);
-    ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
-    if (n <= 0) {
-        return;  // Handle read error or closed connection
+    ssize_t read_size = rio_readlineb(&rio, buffer, sizeof(buffer));
+    if (read_size < 0) {
+        perror("Rio read error");
+    } else if (read_size == 0)
+    {
+      return;
     }
 
-    // Parse the command type
-    char command[20];
+    ///Check one of the three cmds only
+    char first_word[30];
     int airport_num, plane_id, start_idx, duration, fuel;
     int gate_num;
-    if (sscanf(buffer, "SCHEDULE %d %d %d %d %d", &airport_num, &plane_id, &start_idx, &duration, &fuel) == 5)
+    int matched = sscanf(buffer, "%29s %d", first_word, &airport_num);
+    if (strncasecmp(first_word, "SCHEDULE", 8) == 0)
     {
-      if (start_idx < 0 || start_idx >= NUM_TIME_SLOTS) {
-        snprintf(buffer, sizeof(buffer), "Error: Invalid 'earliest' time (%d)\n", start_idx);
-        rio_writen(connfd, buffer, strlen(buffer));
-        return; // Stop further processing if duration is invalid
-      }
-      if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
-        snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
-        rio_writen(connfd, buffer, strlen(buffer));
-        return; // Stop further processing if duration is invalid
-      }
-      time_info_t result = schedule_plane(plane_id, start_idx, duration, fuel);
-      if (result.start_time != -1)
+      if (sscanf(buffer + strlen("SCHEDULE"), "%d %d %d %d %d", &airport_num, &plane_id, &start_idx, &duration, &fuel) == 5)
       {
-        snprintf(buffer, sizeof(buffer), "SCHEDULED %d at GATE %d: %02d:%02d-%02d:%02d\n",
-                plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
-                IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
-      } else
-      {
-        snprintf(buffer, sizeof(buffer), "Error: Cannot schedule %d\n", plane_id);
-      }
-      rio_writen(connfd, buffer, strlen(buffer));
-    }
-    else if (sscanf(buffer, "PLANE_STATUS %d %d", &airport_num, &plane_id) == 2)
-    {
-      time_info_t result = lookup_plane_in_airport(plane_id);
-      if (result.start_time != -1)
-      {
-        snprintf(buffer, sizeof(buffer), "PLANE %d scheduled at GATE %d: %02d:%02d-%02d:%02d\n",
-                plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
-                IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
-      } else
-      {
-        snprintf(buffer, sizeof(buffer), "PLANE %d not scheduled at airport %d\n", plane_id, airport_num);
-      }
-      rio_writen(connfd, buffer, strlen(buffer));
-    }
-    else if (sscanf(buffer, "TIME_STATUS %d %d %d %d", &airport_num, &gate_num, &start_idx, &duration) == 4)
-    {
-      if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
-        snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
-        rio_writen(connfd, buffer, strlen(buffer));
-        return; // Stop further processing if duration is invalid
-      }
-      for (int i = start_idx; i <= start_idx + duration; i++)
-      {
-        time_slot_t *ts = get_time_slot_by_idx(get_gate_by_idx(gate_num), i);
-        if (ts == NULL)
-        {
-          snprintf(buffer, sizeof(buffer), "Error: Invalid time slot %d\n", i);
+        if (start_idx < 0 || start_idx >= NUM_TIME_SLOTS) {
+          snprintf(buffer, sizeof(buffer), "Error: Invalid 'earliest' time (%d)\n", start_idx);
           rio_writen(connfd, buffer, strlen(buffer));
-          continue;
+          return; // Stop further processing if duration is invalid
         }
-        snprintf(buffer, sizeof(buffer), "AIRPORT %d GATE %d %02d:%02d: %c - %d\n",
-                airport_num, gate_num, IDX_TO_HOUR(i), IDX_TO_MINS(i),
-                ts->status ? 'A' : 'F', ts->status ? ts->plane_id : 0);
+        if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
+          snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
+          rio_writen(connfd, buffer, strlen(buffer));
+          return; // Stop further processing if duration is invalid
+        }
+        time_info_t result = schedule_plane(plane_id, start_idx, duration, fuel);
+        if (result.start_time != -1)
+        {
+          snprintf(buffer, sizeof(buffer), "SCHEDULED %d at GATE %d: %02d:%02d-%02d:%02d\n",
+                  plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
+                  IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
+        } else
+        {
+          snprintf(buffer, sizeof(buffer), "Error: Cannot schedule %d\n", plane_id);
+        }
+        rio_writen(connfd, buffer, strlen(buffer));
+      } else
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
         rio_writen(connfd, buffer, strlen(buffer));
       }
-    } else
+    } else if (strncasecmp(first_word, "PLANE_STATUS", 12) == 0)
     {
-      // Invalid request type
+      if (sscanf(buffer + strlen("PLANE_STATUS"), "%d %d", &airport_num, &plane_id) == 2)
+      {
+        time_info_t result = lookup_plane_in_airport(plane_id);
+        if (result.start_time != -1)
+        {
+          snprintf(buffer, sizeof(buffer), "PLANE %d scheduled at GATE %d: %02d:%02d-%02d:%02d\n",
+                  plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
+                  IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
+        } else
+        {
+          snprintf(buffer, sizeof(buffer), "PLANE %d not scheduled at airport %d\n", plane_id, airport_num);
+        }
+        rio_writen(connfd, buffer, strlen(buffer));
+      } else
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+        rio_writen(connfd, buffer, strlen(buffer));
+      }
+    } else if (strncasecmp(first_word, "TIME_STATUS", 11) == 0)
+    {
+      if (sscanf(buffer + strlen("TIME_STATUS"), "%d %d %d %d", &airport_num, &gate_num, &start_idx, &duration) == 4)
+      {
+        if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
+          snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
+          rio_writen(connfd, buffer, strlen(buffer));
+          return; // Stop further processing if duration is invalid
+        }
+        for (int i = start_idx; i <= start_idx + duration; i++)
+        {
+          time_slot_t *ts = get_time_slot_by_idx(get_gate_by_idx(gate_num), i);
+          if (ts == NULL)
+          {
+            snprintf(buffer, sizeof(buffer), "Error: Invalid time slot %d\n", i);
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+          }
+          snprintf(buffer, sizeof(buffer), "AIRPORT %d GATE %d %02d:%02d: %c - %d\n",
+                  airport_num, gate_num, IDX_TO_HOUR(i), IDX_TO_MINS(i),
+                  ts->status ? 'A' : 'F', ts->status ? ts->plane_id : 0);
+          rio_writen(connfd, buffer, strlen(buffer));
+        }
+      } else
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+        rio_writen(connfd, buffer, strlen(buffer));
+      }
+    }
+     else
+    {
       snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
       rio_writen(connfd, buffer, strlen(buffer));
     }
 }
 
-void *airport_worker_thread(void *arg) {
-    while (1) {
-        // process a request
-        int connfd = dequeue_request();
-        if (connfd < 0) continue;
-
-        handle_airport_request(connfd);
-
-        // Close connection after processing the request
-        close(connfd);
+void *airport_worker_thread(void *arg)
+{
+  while (1)
+  {
+    // process a request
+    int connfd = remove_head_request_fd();
+    if (connfd < 0)
+    {
+      perror("connfd");
+      continue;
     }
-    return NULL;
+
+    handle_airport_request(connfd);
+
+    // Close connection after processing the request
+    close(connfd);
+  }
 }
 
-void airport_node_loop(int listenfd) {
+void airport_node_loop(int listenfd)
+{
   // Initialize the thread pool
-  for (int i = 0; i < AIRPORT_THREAD_POOL_SIZE; i++) {
-        pthread_create(&airport_thread_pool[i], NULL, airport_worker_thread, NULL);
-        pthread_detach(airport_thread_pool[i]);  // Detach threads to avoid memory leaks
+  for (int i = 0; i < AIRPORT_THREAD_POOL_SIZE; i++)
+  {
+    pthread_create(&airport_thread_pool[i], NULL, airport_worker_thread, NULL);
+    pthread_detach(airport_thread_pool[i]);  // Detach threads to avoid memory leaks
   }
-  while (1) {
-        int connfd = accept(listenfd, NULL, NULL);  // Accept a new connection
-        if (connfd < 0) {
-            perror("accept");
-            continue;
-        }
+  while (1)
+  {
+    int connfd = accept(listenfd, NULL, NULL);  // Accept a new connection
+    if (connfd < 0)
+    {
+      perror("accept");
+      continue;
+    }
 
-        enqueue_request(connfd);  // Add the connection to the request queue for processing
+    add_request_fd(connfd);  // Add the connection to the request queue for processing
   }
 }
