@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "request_response.h"
 #include <stdbool.h>
 
 #ifdef ENABLE_LOG
