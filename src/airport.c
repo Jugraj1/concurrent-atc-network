@@ -216,6 +216,16 @@ void handle_airport_request(int connfd) {
     int gate_num;
     if (sscanf(buffer, "SCHEDULE %d %d %d %d %d", &airport_num, &plane_id, &start_idx, &duration, &fuel) == 5)
     {
+      if (start_idx < 0 || start_idx >= NUM_TIME_SLOTS) {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid 'earliest' time (%d)\n", start_idx);
+        rio_writen(connfd, buffer, strlen(buffer));
+        return; // Stop further processing if duration is invalid
+      }
+      if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
+        rio_writen(connfd, buffer, strlen(buffer));
+        return; // Stop further processing if duration is invalid
+      }
       time_info_t result = schedule_plane(plane_id, start_idx, duration, fuel);
       if (result.start_time != -1)
       {
@@ -244,6 +254,11 @@ void handle_airport_request(int connfd) {
     }
     else if (sscanf(buffer, "TIME_STATUS %d %d %d %d", &airport_num, &gate_num, &start_idx, &duration) == 4)
     {
+      if (duration < 0 || duration > NUM_TIME_SLOTS - start_idx) {
+        snprintf(buffer, sizeof(buffer), "Error: Invalid 'duration' value (%d)\n", duration);
+        rio_writen(connfd, buffer, strlen(buffer));
+        return; // Stop further processing if duration is invalid
+      }
       for (int i = start_idx; i <= start_idx + duration; i++)
       {
         time_slot_t *ts = get_time_slot_by_idx(get_gate_by_idx(gate_num), i);

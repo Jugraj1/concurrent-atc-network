@@ -95,16 +95,32 @@ void handle_client_request(int connfd) {
     char buffer[256];
     memset(buffer, '\0', sizeof(buffer));
 
-    
+    printf("Client connected on connfd: %d\n", connfd);
+
+    rio_t rio;
+    rio_readinitb(&rio, connfd);
     while (1)
     {
-      rio_t rio;
-      rio_readinitb(&rio, connfd);
+      
+      
+      printf("Waiting to read request...\n");
       ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
       printf("Received request: %s\n", buffer);
-      if (n <= 0) {
-        break;
+      if (n < 0) {
+            // If there's a read error, check if it’s recoverable (like interrupted system call)
+            if (errno == EINTR) {
+                continue;  // Interrupted by a signal, just try reading again
+            } else {
+                perror("Error reading from client");
+                break;  // Unrecoverable error, exit the loop
+            }
+      } else if (n == 0) {
+            // EOF detected, client has disconnected intentionally (e.g., Ctrl + D)
+            printf("EOF detected, closing connection\n");
+            break;
       }
+      
+      // buffer[strcspn(buffer, "\n")] = '\0';
       // Parse the command to determine the airport number
       char command[20];
       int airport_num;
@@ -113,13 +129,40 @@ void handle_client_request(int connfd) {
       if (sscanf(buffer, "%s %d", command, &airport_num) < 2) {
             snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
             rio_writen(connfd, buffer, strlen(buffer));
+            printf("Invalid request format, sent error response\n");
             continue;
       }
 
+      int param1, param2, param3, param4, num_parsed;
+      if (strcmp(command, "SCHEDULE") == 0) {
+        num_parsed = sscanf(buffer, "%s %d %d %d %d", command, &param1, &param2, &param3, &param4);
+        if (num_parsed != 5) {
+            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+        }
+      } else if (strcmp(command, "PLANE_STATUS") == 0)
+      {
+        num_parsed = sscanf(buffer, "%s %d %d", command, &param1, &param2);
+        if (num_parsed != 3) {
+            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+        }
+      } else if ((strcmp(command, "TIME_STATUS") == 0))
+      {
+        num_parsed = sscanf(buffer, "%s %d %d %d", command, &param1, &param2, &param3);
+        if (num_parsed != 4) {
+            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+        }
+      }
       // Validate airport number
       if (airport_num < 0 || airport_num >= ATC_INFO.num_airports) {
             snprintf(buffer, sizeof(buffer), "Error: Airport %d does not exist\n", airport_num);
             rio_writen(connfd, buffer, strlen(buffer));
+            printf("Invalid airport number %d, sent error response\n", airport_num);
             continue;
       }
 
@@ -129,24 +172,31 @@ void handle_client_request(int connfd) {
       snprintf(port_str, sizeof(port_str), "%d", airport_port);
 
       // Forward the request to the appropriate airport node
+      printf("Connecting to airport node %d on port %s...\n", airport_num, port_str);
       int airport_connfd = open_clientfd("localhost", port_str);
       if (airport_connfd < 0) {
           snprintf(buffer, sizeof(buffer), "Error: Unable to connect to airport %d\n", airport_num);
           rio_writen(connfd, buffer, strlen(buffer));
+          perror("Error connecting to airport node");
           return;
       }
 
       // Forward the request to the airport node
+      printf("Forwarding request to airport node %d\n", airport_num);
       rio_writen(airport_connfd, buffer, strlen(buffer));
       // Receive the response from the airport node and send it back to the client
-      rio_readinitb(&rio, airport_connfd);
-      while ((n = rio_readlineb(&rio, buffer, sizeof(buffer))) > 0) {
-          rio_writen(connfd, buffer, n);  // Write the response back to the client
+      rio_t rio_air;
+      rio_readinitb(&rio_air, airport_connfd);
+      while ((n = rio_readlineb(&rio_air, buffer, sizeof(buffer))) > 0) {
+        printf("Received response from airport node: %s", buffer);
+        rio_writen(connfd, buffer, n);  // Write the response back to the client
       }
 
       close(airport_connfd);  // Close the connection to the airport node
+      printf("Closed connection to airport node %d\n", airport_num);
     }
     close(connfd);
+    printf("Client disconnected from connfd: %d\n", connfd);
     
 }
 
@@ -160,7 +210,7 @@ void *worker_thread(void *arg) {
         // Handle the client request 
         handle_client_request(connfd);
 
-        close(connfd);  // Close the connection after handling the request
+        // close(connfd);  // Close the connection after handling the request
     }
     return NULL;
 }
@@ -351,6 +401,7 @@ int parse_args(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+  setvbuf(stdout, NULL, _IONBF, 0);
   if (parse_args(argc, argv) < 0)
     return 1;
   initialise_network();
