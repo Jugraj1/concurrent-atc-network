@@ -93,8 +93,61 @@ int dequeue_connection() {
 
 void handle_client_request(int connfd) {
     char buffer[256];
-    snprintf(buffer, sizeof(buffer), "Hello from ATC controller!\n");
-    rio_writen(connfd, buffer, strlen(buffer));
+    memset(buffer, '\0', sizeof(buffer));
+
+    
+    while (1)
+    {
+      rio_t rio;
+      rio_readinitb(&rio, connfd);
+      ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
+      printf("Received request: %s\n", buffer);
+      if (n <= 0) {
+        break;
+      }
+      // Parse the command to determine the airport number
+      char command[20];
+      int airport_num;
+
+      // Check if the request format is valid and retrieve the airport number
+      if (sscanf(buffer, "%s %d", command, &airport_num) < 2) {
+            snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+      }
+
+      // Validate airport number
+      if (airport_num < 0 || airport_num >= ATC_INFO.num_airports) {
+            snprintf(buffer, sizeof(buffer), "Error: Airport %d does not exist\n", airport_num);
+            rio_writen(connfd, buffer, strlen(buffer));
+            continue;
+      }
+
+        // Retrieve the port for the target airport node
+      int airport_port = ATC_INFO.airport_nodes[airport_num].port;
+      char port_str[PORT_STRLEN];
+      snprintf(port_str, sizeof(port_str), "%d", airport_port);
+
+      // Forward the request to the appropriate airport node
+      int airport_connfd = open_clientfd("localhost", port_str);
+      if (airport_connfd < 0) {
+          snprintf(buffer, sizeof(buffer), "Error: Unable to connect to airport %d\n", airport_num);
+          rio_writen(connfd, buffer, strlen(buffer));
+          return;
+      }
+
+      // Forward the request to the airport node
+      rio_writen(airport_connfd, buffer, strlen(buffer));
+      // Receive the response from the airport node and send it back to the client
+      rio_readinitb(&rio, airport_connfd);
+      while ((n = rio_readlineb(&rio, buffer, sizeof(buffer))) > 0) {
+          rio_writen(connfd, buffer, n);  // Write the response back to the client
+      }
+
+      close(airport_connfd);  // Close the connection to the airport node
+    }
+    close(connfd);
+    
 }
 
 

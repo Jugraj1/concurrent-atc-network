@@ -206,10 +206,63 @@ void handle_airport_request(int connfd) {
     rio_t rio;
     rio_readinitb(&rio, connfd);
     ssize_t n = rio_readlineb(&rio, buffer, sizeof(buffer));
-    if (n > 0) {
-        printf("Received request: %s", buffer);
-        // for now, simply echo back the request
+    if (n <= 0) {
+        return;  // Handle read error or closed connection
+    }
+
+    // Parse the command type
+    char command[20];
+    int airport_num, plane_id, start_idx, duration, fuel;
+    int gate_num;
+    if (sscanf(buffer, "SCHEDULE %d %d %d %d %d", &airport_num, &plane_id, &start_idx, &duration, &fuel) == 5)
+    {
+      time_info_t result = schedule_plane(plane_id, start_idx, duration, fuel);
+      if (result.start_time != -1)
+      {
+        snprintf(buffer, sizeof(buffer), "SCHEDULED %d at GATE %d: %02d:%02d-%02d:%02d\n",
+                plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
+                IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
+      } else
+      {
+        snprintf(buffer, sizeof(buffer), "Error: Cannot schedule %d\n", plane_id);
+      }
+      rio_writen(connfd, buffer, strlen(buffer));
+    }
+    else if (sscanf(buffer, "PLANE_STATUS %d %d", &airport_num, &plane_id) == 2)
+    {
+      time_info_t result = lookup_plane_in_airport(plane_id);
+      if (result.start_time != -1)
+      {
+        snprintf(buffer, sizeof(buffer), "PLANE %d scheduled at GATE %d: %02d:%02d-%02d:%02d\n",
+                plane_id, result.gate_number, IDX_TO_HOUR(result.start_time), IDX_TO_MINS(result.start_time),
+                IDX_TO_HOUR(result.end_time), IDX_TO_MINS(result.end_time));
+      } else
+      {
+        snprintf(buffer, sizeof(buffer), "PLANE %d not scheduled at airport %d\n", plane_id, airport_num);
+      }
+      rio_writen(connfd, buffer, strlen(buffer));
+    }
+    else if (sscanf(buffer, "TIME_STATUS %d %d %d %d", &airport_num, &gate_num, &start_idx, &duration) == 4)
+    {
+      for (int i = start_idx; i <= start_idx + duration; i++)
+      {
+        time_slot_t *ts = get_time_slot_by_idx(get_gate_by_idx(gate_num), i);
+        if (ts == NULL)
+        {
+          snprintf(buffer, sizeof(buffer), "Error: Invalid time slot %d\n", i);
+          rio_writen(connfd, buffer, strlen(buffer));
+          continue;
+        }
+        snprintf(buffer, sizeof(buffer), "AIRPORT %d GATE %d %02d:%02d: %c - %d\n",
+                airport_num, gate_num, IDX_TO_HOUR(i), IDX_TO_MINS(i),
+                ts->status ? 'A' : 'F', ts->status ? ts->plane_id : 0);
         rio_writen(connfd, buffer, strlen(buffer));
+      }
+    } else
+    {
+      // Invalid request type
+      snprintf(buffer, sizeof(buffer), "Error: Invalid request provided\n");
+      rio_writen(connfd, buffer, strlen(buffer));
     }
 }
 
