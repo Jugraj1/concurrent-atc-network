@@ -1,4 +1,4 @@
-# Air‑Traffic‑Control‑Net (COMP2310 — Assignment 2)
+# Air‑Traffic‑Control‑Net (ANU Project)
 
 > **A concurrent client–server network that schedules aircraft landings across multiple simulated airports.**  
 > Built in C for the *Systems, Networks & Concurrency* course at the Australian National University.
